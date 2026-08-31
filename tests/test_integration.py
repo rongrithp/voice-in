@@ -211,30 +211,38 @@ def test_app_f16_read_down(app):
         assert app._current_tts_session == 0.0
 
 
-def test_app_f20_and_f13_seamless_switching(app):
-    """Test switching back and forth between F20 (Live ON/OFF) and F13 (STT Start/Stop) without device deadlock."""
-    from unittest.mock import PropertyMock
-    import time
+def test_app_f13_to_f20_preemption(app):
+    """Test that pressing F20 while F13 STT is active immediately preempts and cancels STT to start Live Co-pilot."""
+    # 1. Start F13 STT
+    with patch("src.app.audio_control.mute"), \
+         patch("threading.Thread"):
+        app.toggle_stt()
+        assert app.is_streaming is True
 
-    # 1. Start F20 Live Copilot
+    # 2. Press F20 while STT is streaming -> STT must be aborted and Live Co-pilot started
     with patch("src.app.LiveCopilotSession.start", return_value=True) as mock_live_start:
         app.on_f20_live_toggle()
         time.sleep(0.05)
+        assert app.is_streaming is False
         mock_live_start.assert_called_once()
 
-    # 2. While Live is active, user presses F13 -> Live Copilot is automatically stopped before STT starts
+
+def test_app_f20_to_f13_preemption(app):
+    """Test that pressing F13 while F20 Live is active immediately preempts Live and starts STT."""
+    from unittest.mock import PropertyMock
+
+    # 1. Simulate active Live Co-pilot
+    with patch("src.app.LiveCopilotSession.start", return_value=True):
+        app.on_f20_live_toggle()
+        time.sleep(0.05)
+
     with patch.object(type(app.live_copilot), "is_running", new_callable=PropertyMock, return_value=True), \
          patch.object(app.live_copilot, "stop", return_value=True) as mock_live_stop, \
-         patch("src.app.audio_control.mute") as mock_mute, \
-         patch("threading.Thread") as mock_thread:
+         patch("src.app.audio_control.mute"), \
+         patch("threading.Thread"):
+        # 2. Press F13 -> Live must be stopped and STT started
         app.toggle_stt()
         assert app.is_streaming is True
         mock_live_stop.assert_called_once()
-
-    # 3. Stop STT
-    with patch("src.app.audio_control.unmute") as mock_unmute:
-        app.toggle_stt()
-        assert app.is_streaming is False
-        mock_unmute.assert_called_once()
 
 

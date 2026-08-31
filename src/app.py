@@ -113,6 +113,7 @@ class VoiceOperatingHubApp:
     def __init__(self, start_gui: bool = True, hud_overlay: Optional[HUDOverlay] = None):
         self.lock = threading.Lock()
         self._toggle_lock = threading.Lock()  # Re-entrant / concurrency guard for STT toggle
+        self._mode_transition_lock = threading.RLock()  # Inter-lock guard for exclusive F13 vs F20 preemption
         self._stop_event = threading.Event()
         self._warmup_event = threading.Event()
         self.is_streaming = False       # Pipeline A (STT) active state
@@ -410,98 +411,130 @@ class VoiceOperatingHubApp:
                 print(f"[Live STT Interim Stream]: '{clean_text}'", flush=True)
                 self.stream_injector.inject_interim(clean_text)
 
-    def toggle_stt(self):
+    def hard_abort_stt(self):
+        """Preemptively cancels active STT dictation and releases microphone hardware in < 50ms."""
         with self._toggle_lock:
-            if not self.is_streaming:
-                # 0. If Gemini Live Co-pilot is running, stop it completely to release microphone hardware
-                if hasattr(self, "live_copilot") and self.live_copilot and self.live_copilot.is_running:
-                    logger.info("[STT Init] Stopping active Live Co-pilot session to release microphone for STT...")
-                    self.live_copilot.stop()
-                    time.sleep(0.02)
-
-                # 1. Play start chime BEFORE muting master audio so it is crisp and clearly audible
-                self.play_start_chime()
-
-                # 2. Instantly mute Windows Master Audio
-                audio_control.mute()
-
-                # 3. Start STT stream immediately without waiting for warmup
-                self.is_streaming = True
-                self._stt_start_time = time.time()
-                reset_dedup_memory()
-                self.delta_tracker.reset()
-                self.vad_segmenter.reset()
-                self.stream_injector.reset()
-                with self.lock:
-                    self.session_audio_frames.clear()
-                logger.info(f"[Status] 🟢 Cloud Real-Time Live Streaming Active... (Press {config.HOTKEY_STT.upper()} to Stop)")
-
-                if hasattr(self, "hud_overlay") and self.hud_overlay:
-                    self.hud_overlay.show_stt_connecting()
-
-                with self.audio_queue.mutex:
-                    self.audio_queue.queue.clear()
-
-                is_streaming_mode = getattr(config, "STT_MODE", "streaming") == "streaming"
-                if is_streaming_mode and hasattr(self.engine, "create_live_session"):
-                    try:
-                        self.active_live_session = self.engine.create_live_session(on_token_callback=self._on_live_token_received)
-                        if self.active_live_session:
-                            self.active_live_session.start()
-                            logger.info("[STT] Real-time Live WebSocket streaming session started (< 300ms latency).")
-                    except Exception as ex:
-                        logger.error(f"[STT Live Init Error] {ex}")
-                        self.active_live_session = None
-
-                if not self.active_live_session:
-                    threading.Thread(target=self.audio_worker, daemon=True).start()
-
-                threading.Thread(target=self.stream_capture, daemon=True).start()
-                if hasattr(self, "hud_overlay") and self.hud_overlay:
-                    self.hud_overlay.show_stt()
-                self.update_tray_state()
-            else:
-                # 1. Stop mic stream immediately
+            if self.is_streaming:
                 self.is_streaming = False
-                if hasattr(self, "hud_overlay") and self.hud_overlay:
-                    self.hud_overlay.show_stt_finalizing()
-                stt_duration = max(0.0, time.time() - getattr(self, "_stt_start_time", time.time()))
-                self.usage_tracker.record_stt(stt_duration)
-                print(f"[STT Stop] Stopped after {stt_duration:.2f}s -> flushing trailing audio...", flush=True)
-
                 if self.active_live_session:
                     try:
                         self.active_live_session.stop()
                     except Exception as ex:
-                        logger.debug(f"[STT Live Stop Error] {ex}")
+                        logger.debug(f"[Hard Abort STT Live Error]: {ex}")
                     self.active_live_session = None
-                    self.stream_injector.reset()
-                else:
-                    # Final Flush for Batch Mode: Process only any remaining trailing audio slice (< 500ms)
-                    with self.lock:
-                        all_pcm = b"".join(self.session_audio_frames) if self.session_audio_frames else b""
-                        self.session_audio_frames.clear()
-
-                    if all_pcm and len(all_pcm) >= int(config.SAMPLE_RATE * 2 * 0.15): # >= 150ms
-                        session_audio_int16 = np.frombuffer(all_pcm, dtype=np.int16)
-                        final_audio = session_audio_int16.astype(np.float32) / 32768.0
-                        duration = len(final_audio) / config.SAMPLE_RATE
-                        print(f"[Final Flush] Transcribing trailing audio snippet ({duration:.2f}s, {len(all_pcm)} bytes)...", flush=True)
-                        try:
-                            final_text = self.engine.transcribe(final_audio)
-                            if final_text:
-                                final_delta = self.delta_tracker.process_incoming_text(final_text)
-                                if final_delta:
-                                    print(f"[Final Flush Live Injected]: '{final_delta}'", flush=True)
-                                    inject_delta_text(final_delta)
-                        except Exception as ex:
-                            logger.error(f"[Final Flush Error] {ex}")
-
-                # 3. Restore/Unmute Windows Master Audio BEFORE playing stop chime so it is heard
+                self.stream_injector.reset()
+                with self.audio_queue.mutex:
+                    self.audio_queue.queue.clear()
+                with self.lock:
+                    self.session_audio_frames.clear()
                 audio_control.unmute()
-                self.play_stop_chime()
-                logger.info("[STT] ⏹️ Stopped recording & audio unmuted.")
-                self.update_tray_state()
+                logger.info("[App] ⚡ Preempted & aborted active STT capture.")
+
+    def hard_abort_live_copilot(self):
+        """Preemptively stops active Gemini Live Co-pilot and releases microphone hardware in < 50ms."""
+        if self.live_copilot:
+            try:
+                self.live_copilot.stop()
+            except Exception as ex:
+                logger.debug(f"[Hard Abort Live Error]: {ex}")
+            self.live_copilot = None
+        if hasattr(self, "screen_border") and self.screen_border:
+            self.screen_border.hide()
+        logger.info("[App] ⚡ Preempted & stopped active Gemini Live session.")
+
+    def toggle_stt(self):
+        with self._mode_transition_lock:
+            with self._toggle_lock:
+                if not self.is_streaming:
+                    # 0. Preemptively stop Gemini Live Co-pilot if active to guarantee exclusive audio ownership
+                    if hasattr(self, "live_copilot") and self.live_copilot and self.live_copilot.is_running:
+                        logger.info("[Preemption] F13 pressed while F20 Live is active -> Preempting Live Co-pilot...")
+                        self.hard_abort_live_copilot()
+                        time.sleep(0.02)
+
+                    # 1. Play start chime BEFORE muting master audio so it is crisp and clearly audible
+                    self.play_start_chime()
+
+                    # 2. Instantly mute Windows Master Audio
+                    audio_control.mute()
+
+                    # 3. Start STT stream immediately without waiting for warmup
+                    self.is_streaming = True
+                    self._stt_start_time = time.time()
+                    reset_dedup_memory()
+                    self.delta_tracker.reset()
+                    self.vad_segmenter.reset()
+                    self.stream_injector.reset()
+                    with self.lock:
+                        self.session_audio_frames.clear()
+                    logger.info(f"[Status] 🟢 Cloud Real-Time Live Streaming Active... (Press {config.HOTKEY_STT.upper()} to Stop)")
+
+                    if hasattr(self, "hud_overlay") and self.hud_overlay:
+                        self.hud_overlay.show_stt_connecting()
+
+                    with self.audio_queue.mutex:
+                        self.audio_queue.queue.clear()
+
+                    is_streaming_mode = getattr(config, "STT_MODE", "streaming") == "streaming"
+                    if is_streaming_mode and hasattr(self.engine, "create_live_session"):
+                        try:
+                            self.active_live_session = self.engine.create_live_session(on_token_callback=self._on_live_token_received)
+                            if self.active_live_session:
+                                self.active_live_session.start()
+                                logger.info("[STT] Real-time Live WebSocket streaming session started (< 300ms latency).")
+                        except Exception as ex:
+                            logger.error(f"[STT Live Init Error] {ex}")
+                            self.active_live_session = None
+
+                    if not self.active_live_session:
+                        threading.Thread(target=self.audio_worker, daemon=True).start()
+
+                    threading.Thread(target=self.stream_capture, daemon=True).start()
+                    if hasattr(self, "hud_overlay") and self.hud_overlay:
+                        self.hud_overlay.show_stt()
+                    self.update_tray_state()
+                else:
+                    # 1. Stop mic stream immediately
+                    self.is_streaming = False
+                    if hasattr(self, "hud_overlay") and self.hud_overlay:
+                        self.hud_overlay.show_stt_finalizing()
+                    stt_duration = max(0.0, time.time() - getattr(self, "_stt_start_time", time.time()))
+                    self.usage_tracker.record_stt(stt_duration)
+                    print(f"[STT Stop] Stopped after {stt_duration:.2f}s -> flushing trailing audio...", flush=True)
+
+                    if self.active_live_session:
+                        try:
+                            self.active_live_session.stop()
+                        except Exception as ex:
+                            logger.debug(f"[STT Live Stop Error] {ex}")
+                        self.active_live_session = None
+                        self.stream_injector.reset()
+                    else:
+                        # Final Flush for Batch Mode: Process only any remaining trailing audio slice (< 500ms)
+                        with self.lock:
+                            all_pcm = b"".join(self.session_audio_frames) if self.session_audio_frames else b""
+                            self.session_audio_frames.clear()
+
+                        if all_pcm and len(all_pcm) >= int(config.SAMPLE_RATE * 2 * 0.15): # >= 150ms
+                            session_audio_int16 = np.frombuffer(all_pcm, dtype=np.int16)
+                            final_audio = session_audio_int16.astype(np.float32) / 32768.0
+                            duration = len(final_audio) / config.SAMPLE_RATE
+                            print(f"[Final Flush] Transcribing trailing audio snippet ({duration:.2f}s, {len(all_pcm)} bytes)...", flush=True)
+                            try:
+                                final_text = self.engine.transcribe(final_audio)
+                                if final_text:
+                                    final_delta = self.delta_tracker.process_incoming_text(final_text)
+                                    if final_delta:
+                                        print(f"[Final Flush Live Injected]: '{final_delta}'", flush=True)
+                                        inject_delta_text(final_delta)
+                            except Exception as ex:
+                                logger.error(f"[Final Flush Error] {ex}")
+
+                    # 3. Restore/Unmute Windows Master Audio BEFORE playing stop chime so it is heard
+                    audio_control.unmute()
+                    self.play_stop_chime()
+                    logger.info("[STT] ⏹️ Stopped recording & audio unmuted.")
+                    self.update_tray_state()
 
     # Alias for backward compatibility
     toggle = toggle_stt
@@ -1015,56 +1048,51 @@ class VoiceOperatingHubApp:
                 self.hud_overlay.show_live_connecting()
 
         def _toggle_worker():
-            try:
-                # If STT recording is currently active, stop it first to free the mic
-                if self.is_streaming:
-                    logger.info("[LiveCoPilot Init] Stopping active STT stream to allocate microphone to Live Co-pilot...")
-                    self.toggle_stt()
-                    time.sleep(0.02)
+            with self._mode_transition_lock:
+                try:
+                    # If STT recording is currently active, preemptively abort it immediately to free audio hardware
+                    if self.is_streaming:
+                        logger.info("[Preemption] F20 pressed while STT is active -> Preempting STT dictation...")
+                        self.hard_abort_stt()
+                        time.sleep(0.02)
 
-                if not is_currently_running:
-                    # 1. Fresh Session Re-instantiation: guarantees clean state & hydrates Short-term Memory
-                    cur_mon = getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
-                    self.live_copilot = LiveCopilotSession(target_monitor=cur_mon)
-                    self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
-                    self.live_copilot.on_handshake = lambda: self.hud_overlay.show_live_handshake() if hasattr(self, "hud_overlay") and self.hud_overlay else None
-                    self.live_copilot.on_connected = lambda: (
-                        self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None,
-                        self.screen_border.show() if hasattr(self, "screen_border") and self.screen_border else None
-                    )
-                    self.live_copilot.on_error = lambda: self.hud_overlay.show_live_error() if hasattr(self, "hud_overlay") and self.hud_overlay else None
+                    if not is_currently_running:
+                        # 1. Fresh Session Re-instantiation: guarantees clean state & hydrates Short-term Memory
+                        cur_mon = getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
+                        self.live_copilot = LiveCopilotSession(target_monitor=cur_mon)
+                        self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
+                        self.live_copilot.on_handshake = lambda: self.hud_overlay.show_live_handshake() if hasattr(self, "hud_overlay") and self.hud_overlay else None
+                        self.live_copilot.on_connected = lambda: (
+                            self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None,
+                            self.screen_border.show() if hasattr(self, "screen_border") and self.screen_border else None
+                        )
+                        self.live_copilot.on_error = lambda: self.hud_overlay.show_live_error() if hasattr(self, "hud_overlay") and self.hud_overlay else None
 
-                    is_active = self.live_copilot.start()
-                else:
-                    # 2. Instant Stop: Hide HUD and border immediately
+                        is_active = self.live_copilot.start()
+                    else:
+                        # 2. Instant Stop: Hide HUD and border immediately
+                        if hasattr(self, "hud_overlay") and self.hud_overlay:
+                            self.hud_overlay.hide()
+                        if hasattr(self, "screen_border") and self.screen_border:
+                            self.screen_border.hide()
+
+                        self.hard_abort_live_copilot()
+                        is_active = False
+
+                    status_str = "ACTIVE (🟢 ON)" if is_active else "STOPPED (OFF)"
+                    logger.info(f"[Live Co-pilot] Session status toggled -> {status_str}")
+                    self.tray_manager.notify("Gemini Live Co-pilot", f"Live Session: {status_str}")
+                except Exception as ex:
+                    logger.error(f"[Live Co-pilot Error] Failed to toggle live session: {ex}")
                     if hasattr(self, "hud_overlay") and self.hud_overlay:
-                        self.hud_overlay.hide()
-                    if hasattr(self, "screen_border") and self.screen_border:
-                        self.screen_border.hide()
-
-                    if self.live_copilot:
-                        try:
-                            self.live_copilot.stop()
-                        except Exception as stop_err:
-                            logger.debug(f"[LiveCoPilot Stop Notice]: {stop_err}")
-                        self.live_copilot = None
-
-                    is_active = False
-
-                status_str = "ACTIVE (🟢 ON)" if is_active else "STOPPED (OFF)"
-                logger.info(f"[Live Co-pilot] Session status toggled -> {status_str}")
-                self.tray_manager.notify("Gemini Live Co-pilot", f"Live Session: {status_str}")
-            except Exception as ex:
-                logger.error(f"[Live Co-pilot Error] Failed to toggle live session: {ex}")
-                if hasattr(self, "hud_overlay") and self.hud_overlay:
-                    self.hud_overlay.show_live_error()
-            finally:
-                if not (self.live_copilot and self.live_copilot.is_running) and not self.is_streaming:
-                    if hasattr(self, "hud_overlay") and self.hud_overlay and self.hud_overlay.state != HUDState.LIVE_ERROR:
-                        self.hud_overlay.hide()
-                    if hasattr(self, "screen_border") and self.screen_border:
-                        self.screen_border.hide()
-                self.update_tray_state()
+                        self.hud_overlay.show_live_error()
+                finally:
+                    if not (self.live_copilot and self.live_copilot.is_running) and not self.is_streaming:
+                        if hasattr(self, "hud_overlay") and self.hud_overlay and self.hud_overlay.state != HUDState.LIVE_ERROR:
+                            self.hud_overlay.hide()
+                        if hasattr(self, "screen_border") and self.screen_border:
+                            self.screen_border.hide()
+                    self.update_tray_state()
 
         threading.Thread(target=_toggle_worker, daemon=True, name="LiveToggleWorker").start()
 
