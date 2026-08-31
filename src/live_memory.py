@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger("LiveMemory")
 
-DEFAULT_MEMORY_FILE = os.path.join(".cache", "live_memory.json")
+DEFAULT_MEMORY_FILE = os.path.join("data", "live_memory.json")
 MAX_STORED_SESSIONS = 10
 
 
