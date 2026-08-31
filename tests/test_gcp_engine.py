@@ -47,7 +47,12 @@ def test_gcp_speech_stream_session_send_and_stop():
 
 def test_gcp_speech_stream_recognition():
     emitted = []
-    session = GCPSpeechStreamSession(on_token_callback=lambda t: (emitted.append(t), session._running.clear()), client=None)
+    def on_token(t, is_final=False):
+        emitted.append((t, is_final))
+        if is_final:
+            session._running.clear()
+
+    session = GCPSpeechStreamSession(on_token_callback=on_token, client=None)
     session._running.set()
 
     mock_speech = MagicMock()
@@ -72,8 +77,8 @@ def test_gcp_speech_stream_recognition():
     }):
         session._run_grpc_stream()
 
-    assert "สวัสดีครับ" in emitted
-    assert "สวัสดี" not in emitted  # Interim draft was not emitted directly
+    assert ("สวัสดี", False) in emitted
+    assert ("สวัสดีครับ", True) in emitted
 
 def test_gcp_speech_stream_interim_flushed_on_stop():
     emitted = []

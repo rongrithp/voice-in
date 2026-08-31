@@ -69,6 +69,18 @@ class GCPSpeechStreamSession:
             logger.info(f"[GCPSpeechStream] gRPC streaming session started (Language: {self.language_code})")
             return True
 
+    def _emit_callback(self, text: str, is_final: bool = False):
+        """Dispatches transcription text to callback, supporting both (text, is_final) and legacy (text) signatures."""
+        if not text or not self.on_token_callback:
+            return
+        try:
+            self.on_token_callback(text, is_final)
+        except TypeError:
+            if is_final:
+                self.on_token_callback(text)
+        except Exception as ex:
+            logger.debug(f"[GCPSpeechStream Callback Exception]: {ex}")
+
     def _run_grpc_stream(self):
         try:
             from google.cloud import speech_v1 as speech
@@ -136,21 +148,18 @@ class GCPSpeechStreamSession:
                         if not transcript:
                             continue
 
-                        # VAD-driven Segment Finalization
+                        # Real-Time Streaming Output
                         if result.is_final:
                             with self._state_lock:
                                 self._last_interim_text = ""
                                 self._last_finalized_text = transcript
                             logger.info(f"[GCPSpeechStream Finalized Segment]: '{transcript}'")
-                            if self.on_token_callback:
-                                try:
-                                    self.on_token_callback(transcript)
-                                except Exception as cb_err:
-                                    logger.error(f"[GCPSpeechStream Callback Error]: {cb_err}")
+                            self._emit_callback(transcript, is_final=True)
                         else:
-                            # Strict overwrite of interim hypothesis (never accumulate)
+                            # Stream interim hypothesis in real-time (<50ms typing latency)
                             with self._state_lock:
                                 self._last_interim_text = transcript
+                            self._emit_callback(transcript, is_final=False)
 
                 except Exception as stream_err:
                     if self._running.is_set():
@@ -193,12 +202,9 @@ class GCPSpeechStreamSession:
                     self._had_speech = False
                     self._silence_ms = 0
 
-                    if text_to_flush and self.on_token_callback:
+                    if text_to_flush:
                         logger.info(f"[GCPSpeechStream Silence VAD Finalized ({silence_limit_ms}ms)]: '{text_to_flush}'")
-                        try:
-                            self.on_token_callback(text_to_flush)
-                        except Exception as cb_err:
-                            logger.error(f"[GCPSpeechStream Callback Error]: {cb_err}")
+                        self._emit_callback(text_to_flush, is_final=True)
 
                     # Signal stream turn recycle for fresh utterance
                     self._current_stream_done.set()
@@ -218,17 +224,14 @@ class GCPSpeechStreamSession:
         if self._thread and self._thread.is_alive() and threading.current_thread() != self._thread:
             self._thread.join(timeout=1.0)
 
-        # Flush trailing unfinalized speech on session termination (F21)
+        # Flush trailing unfinalized speech on session termination
         with self._state_lock:
             trailing = self._last_interim_text.strip()
             self._last_interim_text = ""
 
-        if trailing and self.on_token_callback:
+        if trailing:
             logger.info(f"[GCPSpeechStream Termination Flush]: '{trailing}'")
-            try:
-                self.on_token_callback(trailing)
-            except Exception as ex:
-                logger.error(f"[GCPSpeechStream Flush Error]: {ex}")
+            self._emit_callback(trailing, is_final=True)
 
         logger.info("[GCPSpeechStream] Session stopped.")
 

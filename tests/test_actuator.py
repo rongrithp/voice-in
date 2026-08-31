@@ -89,3 +89,40 @@ def test_copy_cursor_to_bottom():
         mock_shift.assert_called_once()
         mock_ctrl_c.assert_called_once()
 
+
+def test_streaming_text_injector():
+    from src.actuator import StreamingTextInjector
+    injector = StreamingTextInjector()
+
+    with patch("src.actuator.paste_text") as mock_paste, \
+         patch("src.actuator._send_space") as mock_space, \
+         patch.object(injector, "_send_backspaces") as mock_backspaces:
+
+        # 1. Initial interim chunk
+        injector.inject_interim("กำลัง")
+        mock_paste.assert_called_with("กำลัง", add_space=False)
+        assert injector._current_interim_text == "กำลัง"
+
+        # 2. Monotonic extension (append only delta)
+        mock_paste.reset_mock()
+        injector.inject_interim("กำลังทดสอบ")
+        mock_paste.assert_called_with("ทดสอบ", add_space=False)
+        mock_backspaces.assert_not_called()
+        assert injector._current_interim_text == "กำลังทดสอบ"
+
+        # 3. Revision (differs from prefix -> backspace & replace)
+        mock_paste.reset_mock()
+        mock_backspaces.reset_mock()
+        injector.inject_interim("การทดสอบ")
+        mock_backspaces.assert_called_with(len("ำลังทดสอบ"))
+        mock_paste.assert_called_with("ารทดสอบ", add_space=False)
+        assert injector._current_interim_text == "การทดสอบ"
+
+        # 4. Final confirmation
+        mock_paste.reset_mock()
+        mock_backspaces.reset_mock()
+        injector.inject_final("การทดสอบระบบ", add_space=True)
+        mock_paste.assert_called_with("ระบบ", add_space=True)
+        assert injector._current_interim_text == ""
+
+

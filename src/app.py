@@ -12,7 +12,7 @@ import config
 from src.sanitizer import sanitize_text, reset_dedup_memory, DeltaTextTracker
 from src.router import TranscribeEngine
 from src.vad import WebRTCVADSegmenter
-from src.actuator import inject_to_cursor, inject_delta_text, copy_cursor_to_bottom, copy_selected_text, TextActuator, paste_text
+from src.actuator import inject_to_cursor, inject_delta_text, copy_cursor_to_bottom, copy_selected_text, TextActuator, paste_text, StreamingTextInjector
 from src.audio import calculate_rms, is_silence, robust_audio_stream_capture, LiveAudioStreamProducer
 from src import audio_control
 from src.tts_engine import TTSEngine, split_text_chunks
@@ -124,6 +124,7 @@ class VoiceOperatingHubApp:
         self.vad_segmenter = WebRTCVADSegmenter()
         self.delta_tracker = DeltaTextTracker()
         self.actuator = TextActuator()
+        self.stream_injector = StreamingTextInjector()
         self.tts_engine = TTSEngine()
         initial_tts_speed = float(getattr(config, "TTS_SPEAKING_RATE", 1.0))
         initial_tts_voice = getattr(config, "TTS_VOICE", "th-TH-Neural2-C")
@@ -385,14 +386,20 @@ class VoiceOperatingHubApp:
         logger.info(f"[Hotkey] {config.HOTKEY_STT.upper()} Double Click (<{thresh_ms:.0f}ms) -> Emergency STT abort & unmute.")
         self.emergency_flush_stt()
 
-    def _on_live_token_received(self, text: str):
-        """Callback invoked when live streaming STT yields a finalized utterance segment."""
+    def _on_live_token_received(self, text: str, is_final: bool = True):
+        """Callback invoked when live streaming STT yields interim (real-time typing) or finalized utterance segments."""
         if not text:
             return
-        clean_text = sanitize_text(text, check_dedup=True)
-        if clean_text:
-            print(f"[Live STT Segment Finalized Injected]: '{clean_text}'", flush=True)
-            self.actuator.paste_text(clean_text)
+        if is_final:
+            clean_text = sanitize_text(text, check_dedup=True)
+            if clean_text:
+                print(f"[Live STT Final Injected]: '{clean_text}'", flush=True)
+                self.stream_injector.inject_final(clean_text, add_space=True)
+        else:
+            clean_text = sanitize_text(text, check_dedup=False)
+            if clean_text:
+                print(f"[Live STT Interim Stream]: '{clean_text}'", flush=True)
+                self.stream_injector.inject_interim(clean_text)
 
     def toggle_stt(self):
         with self._toggle_lock:
@@ -415,6 +422,7 @@ class VoiceOperatingHubApp:
                 reset_dedup_memory()
                 self.delta_tracker.reset()
                 self.vad_segmenter.reset()
+                self.stream_injector.reset()
                 with self.lock:
                     self.session_audio_frames.clear()
                 logger.info(f"[Status] 🟢 Cloud Real-Time Live Streaming Active... (Press {config.HOTKEY_STT.upper()} to Stop)")
@@ -451,6 +459,7 @@ class VoiceOperatingHubApp:
                     except Exception as ex:
                         logger.debug(f"[STT Live Stop Error] {ex}")
                     self.active_live_session = None
+                    self.stream_injector.reset()
                 else:
                     # Final Flush for Batch Mode: Process only any remaining trailing audio slice (< 500ms)
                     with self.lock:
