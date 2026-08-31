@@ -13,6 +13,14 @@ def main():
     hud.start()
     time.sleep(0.5)
 
+    print("0. Showing System Booting State (Yellow)...")
+    hud.show_system_booting()
+    time.sleep(1.5)
+
+    print("0.1 Showing System Ready State (Green with 2.5s auto-hide)...")
+    hud.show_system_ready(auto_hide_seconds=2.5)
+    time.sleep(3.0)
+
     print("1. Showing STT Connecting State (Yellow)...")
     hud.show_stt_connecting()
     time.sleep(1.5)

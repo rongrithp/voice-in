@@ -17,6 +17,17 @@ def test_hud_overlay_states_and_transitions():
     hud._pill_frame = MagicMock()
     hud._label = MagicMock()
 
+    # 0. Test System Booting & Ready States
+    hud.show_system_booting()
+    assert hud.state == HUDState.SYSTEM_BOOTING
+    hud._apply_state(HUDState.SYSTEM_BOOTING)
+    assert "INITIALIZING SYSTEM" in hud._label.configure.call_args.kwargs["text"]
+
+    hud.show_system_ready(auto_hide_seconds=2.5)
+    assert hud.state == HUDState.SYSTEM_READY
+    hud._apply_state(HUDState.SYSTEM_READY)
+    assert "SYSTEM READY" in hud._label.configure.call_args.kwargs["text"]
+
     # 1. Test STT Connecting & Active & Finalizing States
     hud.show_stt_connecting()
     assert hud.state == HUDState.STT_CONNECTING

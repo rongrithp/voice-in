@@ -9,6 +9,8 @@ logger = logging.getLogger("HUDOverlay")
 
 class HUDState(enum.Enum):
     IDLE = "idle"
+    SYSTEM_BOOTING = "system_booting"
+    SYSTEM_READY = "system_ready"
     STT_CONNECTING = "stt_connecting"
     STT_ACTIVE = "stt_active"
     STT_FINALIZING = "stt_finalizing"
@@ -20,6 +22,18 @@ class HUDState(enum.Enum):
     TTS_ACTIVE = "tts_active"
 
 STATE_CONFIGS = {
+    HUDState.SYSTEM_BOOTING: {
+        "text": "🟡 INITIALIZING SYSTEM & HARDWARE...",
+        "bg": "#111111",
+        "fg": "#fbbf24",
+        "border": "#f59e0b",
+    },
+    HUDState.SYSTEM_READY: {
+        "text": "🟢 SYSTEM READY • PRESS F13 / F20 TO START",
+        "bg": "#111111",
+        "fg": "#ffffff",
+        "border": "#10b981",
+    },
     HUDState.STT_CONNECTING: {
         "text": "🟡 CONNECTING...",
         "bg": "#111111",
@@ -143,9 +157,12 @@ class HUDOverlay:
             )
             self._label.pack()
 
-            # Initially hidden in IDLE state
-            self.root.withdraw()
-            self._is_visible = False
+            # Initially hidden in IDLE state unless a state was queued before mainloop
+            if self.state == HUDState.IDLE:
+                self.root.withdraw()
+                self._is_visible = False
+            else:
+                self._apply_state(self.state)
 
             self._reposition()
             self._schedule_pulse()
@@ -190,7 +207,7 @@ class HUDOverlay:
         if not self.root:
             return
         try:
-            w = 380
+            w = 440
             h = 42
 
             # Resolve Monitor 1 dimensions (Default: UltraWide 3440x1440 at 0,0)
@@ -213,7 +230,7 @@ class HUDOverlay:
             if self.position == "top-right":
                 x = mon_left + mon_width - w - 24
                 y = mon_top + 25
-            else: # top-center: (3440 - 380) // 2 = 1530
+            else: # top-center: (3440 - 440) // 2 = 1500
                 x = mon_left + (mon_width - w) // 2
                 y = mon_top + 25
 
@@ -319,6 +336,16 @@ class HUDOverlay:
             logger.debug(f"[HUD Apply Notice] {e}")
 
     # --- Granular Lifecycle Helper Methods ---
+
+    def show_system_booting(self):
+        """🟡 INITIALIZING SYSTEM & HARDWARE..."""
+        self.set_state(HUDState.SYSTEM_BOOTING)
+
+    def show_system_ready(self, auto_hide_seconds: float = 2.5):
+        """🟢 SYSTEM READY • PRESS F13 / F20 TO START"""
+        self.set_state(HUDState.SYSTEM_READY)
+        if self.root and auto_hide_seconds > 0:
+            self.root.after(int(auto_hide_seconds * 1000), self.hide)
 
     def show_stt_connecting(self):
         """🟡 CONNECTING..."""

@@ -172,6 +172,7 @@ class VoiceOperatingHubApp:
         if start_gui:
             self.dashboard_gui.start_in_thread()
             self.hud_overlay.start()
+            self.hud_overlay.show_system_booting()
             self.screen_border.start()
 
         # System Tray Manager (Lightweight init)
@@ -1236,6 +1237,10 @@ class VoiceOperatingHubApp:
         total_startup_ms = (time.perf_counter() - t_run_start) * 1000
         print(f"[Startup Benchmark] Main Thread Startup Complete in {total_startup_ms:.1f}ms (< 100ms)", flush=True)
         logger.info("[Ready] Voice Operating Hub Daemon active.")
+
+        # Display System Ready Status for 2.5s on HUD
+        if hasattr(self, "hud_overlay") and self.hud_overlay:
+            self.hud_overlay.show_system_ready(auto_hide_seconds=2.5)
 
         # Keep main thread alive safely using threading.Event
         try:
