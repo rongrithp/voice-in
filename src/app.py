@@ -164,6 +164,7 @@ class VoiceOperatingHubApp:
         # On-Screen Floating Pill HUD Overlay
         self.hud_overlay = HUDOverlay(position="top-center")
         self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
+        self.live_copilot.on_connected = lambda: self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None
 
         if start_gui:
             self.dashboard_gui.start_in_thread()
@@ -428,6 +429,9 @@ class VoiceOperatingHubApp:
                     self.session_audio_frames.clear()
                 logger.info(f"[Status] 🟢 Cloud Real-Time Live Streaming Active... (Press {config.HOTKEY_STT.upper()} to Stop)")
 
+                if hasattr(self, "hud_overlay") and self.hud_overlay:
+                    self.hud_overlay.show_stt_connecting()
+
                 with self.audio_queue.mutex:
                     self.audio_queue.queue.clear()
 
@@ -446,10 +450,14 @@ class VoiceOperatingHubApp:
                     threading.Thread(target=self.audio_worker, daemon=True).start()
 
                 threading.Thread(target=self.stream_capture, daemon=True).start()
+                if hasattr(self, "hud_overlay") and self.hud_overlay:
+                    self.hud_overlay.show_stt()
                 self.update_tray_state()
             else:
                 # 1. Stop mic stream immediately
                 self.is_streaming = False
+                if hasattr(self, "hud_overlay") and self.hud_overlay:
+                    self.hud_overlay.show_stt_finalizing()
                 stt_duration = max(0.0, time.time() - getattr(self, "_stt_start_time", time.time()))
                 self.usage_tracker.record_stt(stt_duration)
                 print(f"[STT Stop] Stopped after {stt_duration:.2f}s -> flushing trailing audio...", flush=True)
@@ -1001,13 +1009,22 @@ class VoiceOperatingHubApp:
                     self.toggle_stt()
                     time.sleep(0.02)
 
+                if not self.live_copilot.is_running:
+                    if hasattr(self, "hud_overlay") and self.hud_overlay:
+                        self.hud_overlay.show_live_connecting()
+                else:
+                    if hasattr(self, "hud_overlay") and self.hud_overlay:
+                        self.hud_overlay.show_live_closing()
+
                 is_active = self.live_copilot.toggle()
+
                 status_str = "ACTIVE (🟢 ON)" if is_active else "STOPPED (OFF)"
                 logger.info(f"[Live Co-pilot] Session status toggled -> {status_str}")
                 self.tray_manager.notify("Gemini Live Co-pilot", f"Live Session: {status_str}")
                 self.update_tray_state()
             except Exception as ex:
                 logger.error(f"[Live Co-pilot Error] Failed to toggle live session: {ex}")
+                self.update_tray_state()
 
         threading.Thread(target=_toggle_worker, daemon=True, name="LiveToggleWorker").start()
 

@@ -187,6 +187,7 @@ class LiveCopilotSession:
         self.memory = LiveSessionMemory()
         self._session_transcript: list[dict[str, Any]] = []
         self.on_audio_level = None
+        self.on_connected = None
 
         # Instant reference to pre-warmed client if already ready
         if _GLOBAL_LIVE_CLIENT is not None:
@@ -800,6 +801,11 @@ class LiveCopilotSession:
                                 logger.info(f"✅ [LiveCopilot Connected] Live session active on '{target_model}'")
                                 self._is_connected = True
                                 connected = True
+                                if hasattr(self, "on_connected") and self.on_connected:
+                                    try:
+                                        self.on_connected()
+                                    except Exception:
+                                        pass
                                 _clear_queues()
                                 barge_in_event.clear()
                                 session_active_event.set()

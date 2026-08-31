@@ -17,36 +17,44 @@ def test_hud_overlay_states_and_transitions():
     hud._pill_frame = MagicMock()
     hud._label = MagicMock()
 
-    # 1. Test STT Active State
+    # 1. Test STT Connecting & Active & Finalizing States
+    hud.show_stt_connecting()
+    assert hud.state == HUDState.STT_CONNECTING
+    hud._apply_state(HUDState.STT_CONNECTING)
+    assert "CONNECTING" in hud._label.configure.call_args.kwargs["text"]
+
     hud.show_stt()
     assert hud.state == HUDState.STT_ACTIVE
     hud._apply_state(HUDState.STT_ACTIVE)
-    hud._label.configure.assert_called_with(
-        text=STATE_CONFIGS[HUDState.STT_ACTIVE]["text"],
-        bg=STATE_CONFIGS[HUDState.STT_ACTIVE]["bg"],
-        fg=STATE_CONFIGS[HUDState.STT_ACTIVE]["fg"]
-    )
+    assert "🔴 [STT STREAMING]" in hud._label.configure.call_args.kwargs["text"]
     mock_root.deiconify.assert_called()
 
-    # 2. Test Live Gemini Active State
+    hud.show_stt_finalizing()
+    assert hud.state == HUDState.STT_FINALIZING
+    hud._apply_state(HUDState.STT_FINALIZING)
+    assert "FINALIZING" in hud._label.configure.call_args.kwargs["text"]
+
+    # 2. Test Live Gemini Connecting & Active & Closing States
+    hud.show_live_connecting()
+    assert hud.state == HUDState.LIVE_CONNECTING
+    hud._apply_state(HUDState.LIVE_CONNECTING)
+    assert "HANDSHAKE" in hud._label.configure.call_args.kwargs["text"]
+
     hud.show_live()
     assert hud.state == HUDState.LIVE_ACTIVE
     hud._apply_state(HUDState.LIVE_ACTIVE)
-    hud._label.configure.assert_called_with(
-        text=STATE_CONFIGS[HUDState.LIVE_ACTIVE]["text"],
-        bg=STATE_CONFIGS[HUDState.LIVE_ACTIVE]["bg"],
-        fg=STATE_CONFIGS[HUDState.LIVE_ACTIVE]["fg"]
-    )
+    assert "🟢 [GEMINI LIVE] CONNECTED" in hud._label.configure.call_args.kwargs["text"]
+
+    hud.show_live_closing()
+    assert hud.state == HUDState.LIVE_CLOSING
+    hud._apply_state(HUDState.LIVE_CLOSING)
+    assert "CLOSING SESSION" in hud._label.configure.call_args.kwargs["text"]
 
     # 3. Test TTS Active State
     hud.show_tts()
     assert hud.state == HUDState.TTS_ACTIVE
     hud._apply_state(HUDState.TTS_ACTIVE)
-    hud._label.configure.assert_called_with(
-        text=STATE_CONFIGS[HUDState.TTS_ACTIVE]["text"],
-        bg=STATE_CONFIGS[HUDState.TTS_ACTIVE]["bg"],
-        fg=STATE_CONFIGS[HUDState.TTS_ACTIVE]["fg"]
-    )
+    assert "🔊 [TTS READING]" in hud._label.configure.call_args.kwargs["text"]
 
     # 4. Test Hide / IDLE State
     hud._is_visible = True
@@ -97,6 +105,6 @@ def test_hud_overlay_audio_level():
     # Direct apply level
     hud._apply_audio_level("▰▰▰▱")
     call_text = hud._label.configure.call_args.kwargs.get("text", "")
-    assert "🔴 [LIVE UPLOADING] STT ACTIVE • MIC ON" in call_text
+    assert "🔴 [STT STREAMING] MIC ON • SPEAK NOW" in call_text
     assert "▰▰▰▱" in call_text
 
