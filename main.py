@@ -26,6 +26,16 @@ elif hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 
+# -------------------------------------------------------------------------
+# FAST-PATH BOOT SEQUENCE: Instant GUI Display (< 0.1s)
+# -------------------------------------------------------------------------
+print("[Startup] Instantiating Fast-Path HUD Splash...", flush=True)
+from src.hud_overlay import HUDOverlay, HUDState
+
+hud = HUDOverlay(position="top-center")
+hud.start()
+hud.show_system_booting("🟡 [1/3] LOADING AUDIO & HARDWARE...")
+
 print("[Startup] Initializing Voice Operating Hub Daemon...", flush=True)
 
 t_import_start = time.perf_counter()
@@ -35,9 +45,10 @@ print(f"[Startup Benchmark] Application modules imported in {import_ms:.1f}ms", 
 
 if __name__ == "__main__":
     t_app_init = time.perf_counter()
+    hud.show_system_booting("🟡 [2/3] INITIALIZING CLOUD & HOTKEYS...")
     print("[Startup] Instantiating VoiceOperatingHubApp...", flush=True)
     try:
-        app = VoiceOperatingHubApp()
+        app = VoiceOperatingHubApp(hud_overlay=hud)
         init_ms = (time.perf_counter() - t_app_init) * 1000
         print(f"[Startup Benchmark] VoiceOperatingHubApp instantiated in {init_ms:.1f}ms", flush=True)
 

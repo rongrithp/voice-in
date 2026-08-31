@@ -3,6 +3,7 @@ import queue
 import threading
 import time
 import logging
+from typing import Optional, Any
 import winsound
 import numpy as np
 import keyboard
@@ -109,7 +110,7 @@ class VoiceOperatingHubApp:
     with OS Master Audio Control and System Tray Manager.
     """
 
-    def __init__(self, start_gui: bool = True):
+    def __init__(self, start_gui: bool = True, hud_overlay: Optional[HUDOverlay] = None):
         self.lock = threading.Lock()
         self._toggle_lock = threading.Lock()  # Re-entrant / concurrency guard for STT toggle
         self._stop_event = threading.Event()
@@ -163,7 +164,7 @@ class VoiceOperatingHubApp:
             usage_tracker_ref=self.usage_tracker
         )
         # On-Screen Floating Pill HUD & Neon Screen Border Overlays
-        self.hud_overlay = HUDOverlay(position="top-center")
+        self.hud_overlay = hud_overlay if hud_overlay is not None else HUDOverlay(position="top-center")
         self.screen_border = ScreenBorderOverlay()
         if self.live_copilot:
             self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
@@ -171,8 +172,9 @@ class VoiceOperatingHubApp:
 
         if start_gui:
             self.dashboard_gui.start_in_thread()
-            self.hud_overlay.start()
-            self.hud_overlay.show_system_booting()
+            if hud_overlay is None:
+                self.hud_overlay.start()
+                self.hud_overlay.show_system_booting()
             self.screen_border.start()
 
         # System Tray Manager (Lightweight init)

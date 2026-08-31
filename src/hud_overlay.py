@@ -337,9 +337,9 @@ class HUDOverlay:
 
     # --- Granular Lifecycle Helper Methods ---
 
-    def show_system_booting(self):
-        """🟡 INITIALIZING SYSTEM & HARDWARE..."""
-        self.set_state(HUDState.SYSTEM_BOOTING)
+    def show_system_booting(self, custom_text: Optional[str] = None):
+        """🟡 INITIALIZING SYSTEM & HARDWARE... or custom loading step"""
+        self.set_state(HUDState.SYSTEM_BOOTING, custom_text=custom_text)
 
     def show_system_ready(self, auto_hide_seconds: float = 2.5):
         """🟢 SYSTEM READY • PRESS F13 / F20 TO START"""
