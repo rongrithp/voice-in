@@ -1014,7 +1014,7 @@ class VoiceOperatingHubApp:
                         self.hud_overlay.show_live_connecting()
                 else:
                     if hasattr(self, "hud_overlay") and self.hud_overlay:
-                        self.hud_overlay.show_live_closing()
+                        self.hud_overlay.hide()
 
                 is_active = self.live_copilot.toggle()
 
@@ -1028,6 +1028,9 @@ class VoiceOperatingHubApp:
             except Exception as ex:
                 logger.error(f"[Live Co-pilot Error] Failed to toggle live session: {ex}")
             finally:
+                if not getattr(self.live_copilot, "is_running", False) and not self.is_streaming:
+                    if hasattr(self, "hud_overlay") and self.hud_overlay:
+                        self.hud_overlay.hide()
                 self.update_tray_state()
 
         threading.Thread(target=_toggle_worker, daemon=True, name="LiveToggleWorker").start()

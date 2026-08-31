@@ -19,43 +19,43 @@ class HUDState(enum.Enum):
 
 STATE_CONFIGS = {
     HUDState.STT_CONNECTING: {
-        "text": "🟡 [STT] CONNECTING TO GOOGLE CLOUD...",
+        "text": "🟡 CONNECTING...",
         "bg": "#111111",
         "fg": "#fbbf24",
         "border": "#f59e0b",
     },
     HUDState.STT_ACTIVE: {
-        "text": "🔴 [STT STREAMING] MIC ON • SPEAK NOW",
+        "text": "🔴 RECORDING • SPEAK NOW",
         "bg": "#111111",
         "fg": "#ffffff",
         "border": "#ef4444",
     },
     HUDState.STT_FINALIZING: {
-        "text": "⚪ [STT] INJECTING & FINALIZING...",
+        "text": "⚪ FINALIZING...",
         "bg": "#111111",
         "fg": "#f8fafc",
         "border": "#ffffff",
     },
     HUDState.LIVE_CONNECTING: {
-        "text": "🟡 [GEMINI LIVE] CONNECTING TO MODEL (HANDSHAKE)...",
+        "text": "🟡 CONNECTING MODEL...",
         "bg": "#111111",
         "fg": "#fb923c",
         "border": "#f97316",
     },
     HUDState.LIVE_ACTIVE: {
-        "text": "🟢 [GEMINI LIVE] CONNECTED • SCREEN (MON 1) & VOICE READY",
+        "text": "🟢 READY • SPEAK NOW",
         "bg": "#111111",
         "fg": "#ffffff",
         "border": "#10b981",
     },
     HUDState.LIVE_CLOSING: {
-        "text": "⚪ [GEMINI LIVE] CLOSING SESSION...",
+        "text": "⚪ CLOSING...",
         "bg": "#111111",
         "fg": "#cbd5e1",
         "border": "#94a3b8",
     },
     HUDState.TTS_ACTIVE: {
-        "text": "🔊 [TTS READING] HIGH-FIDELITY PLAYBACK ACTIVE",
+        "text": "🔊 READING...",
         "bg": "#111111",
         "fg": "#ffffff",
         "border": "#06b6d4",
@@ -67,9 +67,8 @@ VU_LEVELS = ["▱▱▱▱", "▰▱▱▱", "▰▰▱▱", "▰▰▰▱", "�
 class HUDOverlay:
     """
     Ultra-lightweight, frameless, topmost, click-through On-Screen Floating Pill HUD.
-    Displays prominent real-time connection lifecycle states and live audio ingestion meters
-    at the top-center of Monitor 1 (UltraWide 3440x1440) whenever STT (F13) or Gemini Live (F20)
-    is active. Guarantees 100% visibility to prevent unintended API billing waste.
+    Displays streamlined real-time connection status and live audio ingestion meters
+    at top-center of Monitor 1 (UltraWide 3440x1440).
     """
 
     def __init__(self, position: str = "top-center"):
@@ -114,19 +113,19 @@ class HUDOverlay:
                 bg="#111111",
                 highlightthickness=3,
                 highlightbackground="#333333",
-                padx=24,
-                pady=8
+                padx=16,
+                pady=4
             )
             self._pill_frame.pack(fill="both", expand=True)
 
             self._label = tk.Label(
                 self._pill_frame,
                 text="● READY",
-                font=("Segoe UI", 12, "bold"),
+                font=("Segoe UI", 11, "bold"),
                 bg="#111111",
                 fg="#ffffff",
-                padx=8,
-                pady=2
+                padx=4,
+                pady=1
             )
             self._label.pack()
 
@@ -177,8 +176,8 @@ class HUDOverlay:
         if not self.root:
             return
         try:
-            w = 480
-            h = 48
+            w = 360
+            h = 42
 
             # Resolve Monitor 1 dimensions (Default: UltraWide 3440x1440 at 0,0)
             mon1 = None
@@ -199,10 +198,10 @@ class HUDOverlay:
 
             if self.position == "top-right":
                 x = mon_left + mon_width - w - 24
-                y = mon_top + 30
-            else: # top-center: (3440 - 480) // 2 = 1480
+                y = mon_top + 20
+            else: # top-center: (3440 - 360) // 2 = 1540
                 x = mon_left + (mon_width - w) // 2
-                y = mon_top + 30
+                y = mon_top + 20
 
             self.root.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
@@ -297,34 +296,34 @@ class HUDOverlay:
         except Exception as e:
             logger.debug(f"[HUD Apply Notice] {e}")
 
-    # --- Granular Helper Methods ---
+    # --- Simplified Helper Methods ---
 
     def show_stt_connecting(self):
-        """🟡 [STT] CONNECTING TO GOOGLE CLOUD..."""
+        """🟡 CONNECTING..."""
         self.set_state(HUDState.STT_CONNECTING)
 
     def show_stt(self):
-        """🔴 [STT STREAMING] MIC ON • SPEAK NOW"""
+        """🔴 RECORDING • SPEAK NOW"""
         self.set_state(HUDState.STT_ACTIVE)
 
     def show_stt_finalizing(self):
-        """⚪ [STT] INJECTING & FINALIZING..."""
+        """⚪ FINALIZING..."""
         self.set_state(HUDState.STT_FINALIZING)
 
     def show_live_connecting(self):
-        """🟡 [GEMINI LIVE] CONNECTING TO MODEL (HANDSHAKE)..."""
+        """🟡 CONNECTING MODEL..."""
         self.set_state(HUDState.LIVE_CONNECTING)
 
     def show_live(self):
-        """🟢 [GEMINI LIVE] CONNECTED • SCREEN (MON 1) & VOICE READY"""
+        """🟢 READY • SPEAK NOW"""
         self.set_state(HUDState.LIVE_ACTIVE)
 
     def show_live_closing(self):
-        """⚪ [GEMINI LIVE] CLOSING SESSION..."""
+        """⚪ CLOSING..."""
         self.set_state(HUDState.LIVE_CLOSING)
 
     def show_tts(self):
-        """🔊 [TTS READING] HIGH-FIDELITY PLAYBACK ACTIVE"""
+        """🔊 READING..."""
         self.set_state(HUDState.TTS_ACTIVE)
 
     def hide(self):

@@ -266,7 +266,7 @@ class LiveCopilotSession:
         _safe_destroy_cv2_windows("Gemini Vision Stream")
 
         if thread_to_join and thread_to_join.is_alive() and threading.current_thread() != thread_to_join:
-            thread_to_join.join(timeout=0.5)
+            thread_to_join.join(timeout=0.1)
 
         self._flush_memory_snapshot()
         logger.info("[LiveCopilot] Session stopped cleanly.")
