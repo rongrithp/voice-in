@@ -355,6 +355,15 @@ class HUDOverlay:
         """🔴 RECORDING • SPEAK NOW"""
         self.set_state(HUDState.STT_ACTIVE)
 
+    def show_stt_interim(self, interim_text: str):
+        """🔴 [LIVE STT] Displays in-flight interim speech on HUD without cursor backspacing."""
+        if not interim_text:
+            return
+        clean_txt = interim_text.strip()
+        if len(clean_txt) > 30:
+            clean_txt = "…" + clean_txt[-28:]
+        self.set_state(HUDState.STT_ACTIVE, custom_text=f"🔴 {clean_txt}")
+
     def show_stt_finalizing(self):
         """⚪ FINALIZING..."""
         self.set_state(HUDState.STT_FINALIZING)

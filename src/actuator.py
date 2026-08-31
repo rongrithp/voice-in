@@ -234,11 +234,10 @@ inject_to_cursor = paste_text
 
 class StreamingTextInjector:
     """
-    Manages real-time interim streaming injection at the active cursor with zero duplication.
-    - As the user speaks, interim hypothesis is typed/injected in real-time.
-    - Monotonic extensions (new text starts with last text) are appended as instant deltas.
-    - Revisions (new text differs from prefix) backspace the difference and replace.
-    - When finalized, injects the remainder, resets the buffer, and appends a separator space.
+    Manages finalized streaming injection at the active cursor with Zero Backspace Policy.
+    - Zero destructive backspaces sent to active cursor/screen.
+    - Finalized utterances are committed cleanly and appended directly to the active cursor.
+    - In-flight interim hypotheses are displayed on HUD without touching screen text.
     """
     def __init__(self):
         self._current_interim_text = ""
@@ -249,75 +248,19 @@ class StreamingTextInjector:
             self._current_interim_text = ""
 
     def inject_interim(self, text: str):
-        """Injects in-progress interim hypothesis in real-time."""
-        if not text:
-            return
+        """No-op on active cursor (Zero Backspace Policy) to eliminate destructive deletions."""
         with self._lock:
-            last = self._current_interim_text
-            if text == last:
-                return
-
-            # Case 1: Monotonic extension (pure addition at the end)
-            if text.startswith(last) and len(last) > 0:
-                delta = text[len(last):]
-                if delta:
-                    paste_text(delta, add_space=False)
-                    self._current_interim_text = text
-                return
-
-            # Case 2: Common prefix revision
-            common_prefix_len = 0
-            min_len = min(len(last), len(text))
-            while common_prefix_len < min_len and last[common_prefix_len] == text[common_prefix_len]:
-                common_prefix_len += 1
-
-            chars_to_delete = len(last) - common_prefix_len
-            if chars_to_delete > 0:
-                self._send_backspaces(chars_to_delete)
-
-            delta_to_add = text[common_prefix_len:]
-            if delta_to_add:
-                paste_text(delta_to_add, add_space=False)
-
             self._current_interim_text = text
 
     def inject_final(self, final_text: str, add_space: bool = True):
-        """Finalizes the utterance segment, commits text, and clears interim tracking."""
+        """Finalizes the utterance segment, commits text cleanly via append-only paste, and clears interim tracking."""
         if not final_text:
             self.reset()
             return
 
         with self._lock:
-            last = self._current_interim_text
-            if final_text.startswith(last) and len(last) > 0:
-                delta = final_text[len(last):]
-                if delta:
-                    paste_text(delta, add_space=add_space)
-                elif add_space:
-                    _send_space()
-            else:
-                if len(last) > 0:
-                    self._send_backspaces(len(last))
-                paste_text(final_text, add_space=add_space)
-
+            paste_text(final_text, add_space=add_space)
             self._current_interim_text = ""
-
-    def _send_backspaces(self, count: int):
-        """Deletes N characters from cursor."""
-        if count <= 0:
-            return
-        if count <= 25 and hasattr(ctypes, 'windll') and hasattr(ctypes.windll, 'user32'):
-            user32 = ctypes.windll.user32
-            VK_BACK = 0x08
-            for _ in range(count):
-                user32.keybd_event(VK_BACK, 0, 0, 0)
-                user32.keybd_event(VK_BACK, 0, KEYEVENTF_KEYUP, 0)
-                time.sleep(0.002)
-        else:
-            try:
-                keyboard.send(f'{count}*backspace')
-            except Exception:
-                pass
 
 
 class TextActuator:

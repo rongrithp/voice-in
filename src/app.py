@@ -397,7 +397,7 @@ class VoiceOperatingHubApp:
         self.emergency_flush_stt()
 
     def _on_live_token_received(self, text: str, is_final: bool = True):
-        """Callback invoked when live streaming STT yields interim (real-time typing) or finalized utterance segments."""
+        """Callback invoked when live streaming STT yields interim (HUD preview only) or finalized utterance segments (Append-only)."""
         if not text:
             return
         if is_final:
@@ -405,11 +405,15 @@ class VoiceOperatingHubApp:
             if clean_text:
                 print(f"[Live STT Final Injected]: '{clean_text}'", flush=True)
                 self.stream_injector.inject_final(clean_text, add_space=True)
+                if hasattr(self, "hud_overlay") and self.hud_overlay:
+                    self.hud_overlay.show_stt()
         else:
             clean_text = sanitize_text(text, check_dedup=False)
             if clean_text:
-                print(f"[Live STT Interim Stream]: '{clean_text}'", flush=True)
+                print(f"[Live STT Interim Preview]: '{clean_text}'", flush=True)
                 self.stream_injector.inject_interim(clean_text)
+                if hasattr(self, "hud_overlay") and self.hud_overlay:
+                    self.hud_overlay.show_stt_interim(clean_text)
 
     def hard_abort_stt(self):
         """Preemptively cancels active STT dictation and releases microphone hardware in < 50ms."""

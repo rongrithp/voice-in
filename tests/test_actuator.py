@@ -90,39 +90,27 @@ def test_copy_cursor_to_bottom():
         mock_ctrl_c.assert_called_once()
 
 
-def test_streaming_text_injector():
+def test_streaming_text_injector_zero_backspace_policy():
     from src.actuator import StreamingTextInjector
     injector = StreamingTextInjector()
 
-    with patch("src.actuator.paste_text") as mock_paste, \
-         patch("src.actuator._send_space") as mock_space, \
-         patch.object(injector, "_send_backspaces") as mock_backspaces:
-
-        # 1. Initial interim chunk
+    with patch("src.actuator.paste_text") as mock_paste:
+        # 1. Interim chunks do NOT touch screen or send backspaces
         injector.inject_interim("กำลัง")
-        mock_paste.assert_called_with("กำลัง", add_space=False)
+        mock_paste.assert_not_called()
         assert injector._current_interim_text == "กำลัง"
 
-        # 2. Monotonic extension (append only delta)
-        mock_paste.reset_mock()
         injector.inject_interim("กำลังทดสอบ")
-        mock_paste.assert_called_with("ทดสอบ", add_space=False)
-        mock_backspaces.assert_not_called()
+        mock_paste.assert_not_called()
         assert injector._current_interim_text == "กำลังทดสอบ"
 
-        # 3. Revision (differs from prefix -> backspace & replace)
-        mock_paste.reset_mock()
-        mock_backspaces.reset_mock()
-        injector.inject_interim("การทดสอบ")
-        mock_backspaces.assert_called_with(len("ำลังทดสอบ"))
-        mock_paste.assert_called_with("ารทดสอบ", add_space=False)
-        assert injector._current_interim_text == "การทดสอบ"
+        injector.inject_interim("การทดสอบภาษาไทย")
+        mock_paste.assert_not_called()
+        assert injector._current_interim_text == "การทดสอบภาษาไทย"
 
-        # 4. Final confirmation
-        mock_paste.reset_mock()
-        mock_backspaces.reset_mock()
-        injector.inject_final("การทดสอบระบบ", add_space=True)
-        mock_paste.assert_called_with("ระบบ", add_space=True)
+        # 2. Finalized utterance commits cleanly via append-only paste
+        injector.inject_final("การทดสอบภาษาไทยเสร็จสิ้น", add_space=True)
+        mock_paste.assert_called_once_with("การทดสอบภาษาไทยเสร็จสิ้น", add_space=True)
         assert injector._current_interim_text == ""
 
 
