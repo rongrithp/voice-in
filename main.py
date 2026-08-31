@@ -3,11 +3,28 @@ import time
 
 t_main_start = time.perf_counter()
 
-# Configure unbuffered / line-buffered stdout and stderr for instantaneous terminal output
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(line_buffering=True)
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(line_buffering=True)
+# Ensure stdout/stderr are valid streams under pythonw.exe (windowless background mode)
+class _SafeStreamWriter:
+    def write(self, text):
+        pass
+    def flush(self):
+        pass
+
+if sys.stdout is None:
+    sys.stdout = _SafeStreamWriter()
+elif hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+if sys.stderr is None:
+    sys.stderr = _SafeStreamWriter()
+elif hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 print("[Startup] Initializing Voice Operating Hub Daemon...", flush=True)
 
