@@ -102,3 +102,36 @@ def test_grab_monitor_thumbnail():
         # Out of bounds monitor
         thumb_none = grab_monitor_thumbnail(99)
         assert thumb_none is None
+
+
+def test_ultrawide_remapped_as_monitor_1():
+    """Verify that UltraWide display (3440x1440 at 0,0) is mapped to Monitor 1 even if enumerated 2nd/3rd."""
+    from src.screen_capture import get_ordered_physical_monitors, get_monitor_dict, get_physical_monitors
+    mock_sct = MagicMock()
+    # Simulate multi-monitor setup where side vertical monitor is index 1 and UltraWide is index 2
+    mock_sct.monitors = [
+        {"left": 0, "top": -280, "width": 4520, "height": 2800},
+        {"left": 3440, "top": -280, "width": 1080, "height": 1920, "is_primary": False}, # Side monitor
+        {"left": 0, "top": 0, "width": 3440, "height": 1440, "is_primary": True},        # UltraWide Master Display
+        {"left": 985, "top": 1440, "width": 1920, "height": 1080, "is_primary": False}   # Bottom monitor
+    ]
+    mock_sct.__enter__.return_value = mock_sct
+
+    ordered = get_ordered_physical_monitors(mock_sct)
+    assert len(ordered) == 3
+    # Monitor 1 MUST be the UltraWide Master Display (3440x1440 at 0,0)
+    assert ordered[0]["width"] == 3440
+    assert ordered[0]["height"] == 1440
+    assert ordered[0]["left"] == 0
+    assert ordered[0]["top"] == 0
+
+    mon1_dict = get_monitor_dict(1, mock_sct)
+    assert mon1_dict["width"] == 3440
+    assert mon1_dict["height"] == 1440
+
+    with patch("mss.MSS", return_value=mock_sct):
+        phys = get_physical_monitors()
+        assert phys[0]["index"] == 1
+        assert "Primary UltraWide" in phys[0]["name"]
+        assert phys[0]["width"] == 3440
+

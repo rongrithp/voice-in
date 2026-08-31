@@ -524,8 +524,8 @@ class LiveCopilotSession:
                         continue
 
         async def screen_vision_worker(session, active_event: asyncio.Event):
+            from src.screen_capture import get_monitor_dict
             with mss.MSS() as sct:
-                monitors = sct.monitors
                 # Strict 1 FPS cap (interval >= 1.0s) and 720p max resolution to prevent bandwidth throttling
                 frame_interval = max(1.0, float(getattr(config, "GEMINI_LIVE_FRAME_INTERVAL", 1.0)))
                 jpeg_quality = min(60, max(40, int(getattr(config, "GEMINI_LIVE_JPEG_QUALITY", 50))))
@@ -533,19 +533,14 @@ class LiveCopilotSession:
                 try:
                     while active_event.is_set() and not self._stop_event.is_set():
                         try:
-                            # Dynamic monitor index lookup at runtime (Default: Monitor 3)
-                            cur_mon = self.target_monitor if self.target_monitor is not None else getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 3)
-                            try:
-                                num_mon = len(monitors)
-                            except (TypeError, Exception):
-                                num_mon = 1
+                            # Dynamic monitor index lookup at runtime (Default: Monitor 1 UltraWide)
+                            cur_mon = self.target_monitor if self.target_monitor is not None else getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
+                            target_mon_idx = max(1, int(cur_mon))
 
-                            if cur_mon >= num_mon or cur_mon < 1:
-                                target_mon_idx = 3 if num_mon > 3 else (1 if num_mon > 1 else 0)
-                            else:
-                                target_mon_idx = cur_mon
+                            target_rect = get_monitor_dict(target_mon_idx, sct)
+                            if not target_rect:
+                                target_rect = sct.monitors[1] if len(sct.monitors) > 1 else {"top": 0, "left": 0, "width": 3440, "height": 1440}
 
-                            target_rect = monitors[target_mon_idx] if hasattr(monitors, "__getitem__") else {"top": 0, "left": 0, "width": 1920, "height": 1080}
                             sct_img = sct.grab(target_rect)
                             if not sct_img or not hasattr(sct_img, "width") or not isinstance(getattr(sct_img, "width", None), int) or sct_img.width <= 0 or not hasattr(sct_img, "bgra") or not isinstance(sct_img.bgra, bytes):
                                 await asyncio.sleep(0.5)

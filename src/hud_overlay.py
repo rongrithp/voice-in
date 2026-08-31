@@ -130,21 +130,40 @@ class HUDOverlay:
             self._is_running = False
 
     def _reposition(self):
-        """Positions the floating HUD pill at top-center of primary screen."""
+        """Positions the floating HUD pill at top-center of Monitor 1 (UltraWide 3440x1440)."""
         if not self.root:
             return
         try:
             self.root.update_idletasks()
-            sw = self.root.winfo_screenwidth()
             w = max(380, self.root.winfo_reqwidth() + 24)
             h = max(42, self.root.winfo_reqheight() + 10)
-            
+
+            # Resolve Monitor 1 dimensions (Default: UltraWide 3440x1440 at 0,0)
+            mon1 = None
+            try:
+                from src.screen_capture import get_monitor_dict
+                mon1 = get_monitor_dict(1)
+            except Exception:
+                pass
+
+            if mon1:
+                mon_left = int(mon1.get("left", 0))
+                mon_top = int(mon1.get("top", 0))
+                mon_width = int(mon1.get("width", 3440))
+            else:
+                mon_left = 0
+                mon_top = 0
+                try:
+                    mon_width = int(self.root.winfo_screenwidth() or 3440)
+                except Exception:
+                    mon_width = 3440
+
             if self.position == "top-right":
-                x = sw - w - 24
-                y = 18
+                x = mon_left + mon_width - w - 24
+                y = mon_top + 15
             else: # top-center
-                x = (sw - w) // 2
-                y = 14
+                x = mon_left + (mon_width - w) // 2
+                y = mon_top + 15
 
             self.root.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
