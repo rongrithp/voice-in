@@ -136,11 +136,17 @@ def sound_feedback(freq: int, ms: int):
 def _safe_destroy_cv2_windows(win_name: Optional[str] = "Gemini Vision Stream"):
     """
     Safely and completely closes OpenCV preview windows on Windows OS.
-    Pumps cv2.waitKey(1) multiple times to flush the Win32 message queue (WM_DESTROY / WM_NCDESTROY)
-    and guarantee the window is fully disposed without hanging the process or blocking GUI threads.
+    Pumps cv2.waitKey(1) and issues Win32 WM_CLOSE to guarantee instant non-blocking window destruction.
     """
     try:
         if win_name:
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.FindWindowW(None, win_name)
+                if hwnd:
+                    ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+            except Exception:
+                pass
             try:
                 cv2.destroyWindow(win_name)
             except Exception:
@@ -257,11 +263,10 @@ class LiveCopilotSession:
             thread_to_join = self._worker_thread
             self._worker_thread = None
 
-        if self.show_preview:
-            _safe_destroy_cv2_windows("Gemini Vision Stream")
+        _safe_destroy_cv2_windows("Gemini Vision Stream")
 
         if thread_to_join and thread_to_join.is_alive() and threading.current_thread() != thread_to_join:
-            thread_to_join.join(timeout=0.3)
+            thread_to_join.join(timeout=0.5)
 
         self._flush_memory_snapshot()
         logger.info("[LiveCopilot] Session stopped cleanly.")

@@ -1018,12 +1018,16 @@ class VoiceOperatingHubApp:
 
                 is_active = self.live_copilot.toggle()
 
+                if not is_active:
+                    if hasattr(self, "hud_overlay") and self.hud_overlay:
+                        self.hud_overlay.hide()
+
                 status_str = "ACTIVE (🟢 ON)" if is_active else "STOPPED (OFF)"
                 logger.info(f"[Live Co-pilot] Session status toggled -> {status_str}")
                 self.tray_manager.notify("Gemini Live Co-pilot", f"Live Session: {status_str}")
-                self.update_tray_state()
             except Exception as ex:
                 logger.error(f"[Live Co-pilot Error] Failed to toggle live session: {ex}")
+            finally:
                 self.update_tray_state()
 
         threading.Thread(target=_toggle_worker, daemon=True, name="LiveToggleWorker").start()

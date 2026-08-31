@@ -177,9 +177,8 @@ class HUDOverlay:
         if not self.root:
             return
         try:
-            self.root.update_idletasks()
-            w = max(480, self.root.winfo_reqwidth() + 32)
-            h = max(48, self.root.winfo_reqheight() + 12)
+            w = 480
+            h = 48
 
             # Resolve Monitor 1 dimensions (Default: UltraWide 3440x1440 at 0,0)
             mon1 = None
@@ -189,22 +188,19 @@ class HUDOverlay:
             except Exception:
                 pass
 
-            if mon1:
+            if mon1 and mon1.get("width") and mon1.get("height"):
                 mon_left = int(mon1.get("left", 0))
                 mon_top = int(mon1.get("top", 0))
                 mon_width = int(mon1.get("width", 3440))
             else:
                 mon_left = 0
                 mon_top = 0
-                try:
-                    mon_width = int(self.root.winfo_screenwidth() or 3440)
-                except Exception:
-                    mon_width = 3440
+                mon_width = 3440
 
             if self.position == "top-right":
                 x = mon_left + mon_width - w - 24
                 y = mon_top + 30
-            else: # top-center
+            else: # top-center: (3440 - 480) // 2 = 1480
                 x = mon_left + (mon_width - w) // 2
                 y = mon_top + 30
 
