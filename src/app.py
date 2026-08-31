@@ -24,6 +24,7 @@ from src.live_copilot import LiveCopilotSession
 from src.gui_dashboard import DashboardGUI
 from src.windows_local_tts import WindowsNativeTTSEngine
 from src.hud_overlay import HUDOverlay, HUDState
+from src.screen_border_overlay import ScreenBorderOverlay
 
 logger = logging.getLogger("VoiceOperatingHub")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -158,17 +159,20 @@ class VoiceOperatingHubApp:
             on_emergency_unmute=self.emergency_unmute,
             on_reset_usage=self.on_reset_usage,
             on_exit=self.stop,
-            is_live_active_cb=lambda: self.live_copilot.is_running,
+            is_live_active_cb=lambda: bool(self.live_copilot and self.live_copilot.is_running),
             usage_tracker_ref=self.usage_tracker
         )
-        # On-Screen Floating Pill HUD Overlay
+        # On-Screen Floating Pill HUD & Neon Screen Border Overlays
         self.hud_overlay = HUDOverlay(position="top-center")
-        self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
-        self.live_copilot.on_connected = lambda: self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None
+        self.screen_border = ScreenBorderOverlay()
+        if self.live_copilot:
+            self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
+            self.live_copilot.on_connected = lambda: self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None
 
         if start_gui:
             self.dashboard_gui.start_in_thread()
             self.hud_overlay.start()
+            self.screen_border.start()
 
         # System Tray Manager (Lightweight init)
         self.tray_manager = TrayManager(
@@ -182,7 +186,7 @@ class VoiceOperatingHubApp:
             on_live_toggle=self.on_f20_live_toggle,
             on_windows_local_tts=self.on_f21_windows_local_tts,
             on_exit=self.stop,
-            is_live_active_callback=lambda: self.live_copilot.is_running,
+            is_live_active_callback=lambda: bool(self.live_copilot and self.live_copilot.is_running),
             app_title="Voice Operating Hub",
             current_speed=initial_tts_speed,
             current_voice=initial_tts_voice,
@@ -1009,18 +1013,36 @@ class VoiceOperatingHubApp:
                     self.toggle_stt()
                     time.sleep(0.02)
 
-                if not self.live_copilot.is_running:
+                is_currently_running = bool(self.live_copilot and self.live_copilot.is_running)
+
+                if not is_currently_running:
+                    # 1. Fresh Session Re-instantiation: guarantees clean state & hydrates Short-term Memory
+                    cur_mon = getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
+                    self.live_copilot = LiveCopilotSession(target_monitor=cur_mon)
+                    self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
+                    self.live_copilot.on_connected = lambda: self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None
+
                     if hasattr(self, "hud_overlay") and self.hud_overlay:
                         self.hud_overlay.show_live_connecting()
+                    if hasattr(self, "screen_border") and self.screen_border:
+                        self.screen_border.show()
+
+                    is_active = self.live_copilot.start()
                 else:
+                    # 2. Instant Stop: Hide HUD and border immediately
                     if hasattr(self, "hud_overlay") and self.hud_overlay:
                         self.hud_overlay.hide()
+                    if hasattr(self, "screen_border") and self.screen_border:
+                        self.screen_border.hide()
 
-                is_active = self.live_copilot.toggle()
+                    if self.live_copilot:
+                        try:
+                            self.live_copilot.stop()
+                        except Exception as stop_err:
+                            logger.debug(f"[LiveCoPilot Stop Notice]: {stop_err}")
+                        self.live_copilot = None
 
-                if not is_active:
-                    if hasattr(self, "hud_overlay") and self.hud_overlay:
-                        self.hud_overlay.hide()
+                    is_active = False
 
                 status_str = "ACTIVE (🟢 ON)" if is_active else "STOPPED (OFF)"
                 logger.info(f"[Live Co-pilot] Session status toggled -> {status_str}")
@@ -1028,9 +1050,11 @@ class VoiceOperatingHubApp:
             except Exception as ex:
                 logger.error(f"[Live Co-pilot Error] Failed to toggle live session: {ex}")
             finally:
-                if not getattr(self.live_copilot, "is_running", False) and not self.is_streaming:
+                if not (self.live_copilot and self.live_copilot.is_running) and not self.is_streaming:
                     if hasattr(self, "hud_overlay") and self.hud_overlay:
                         self.hud_overlay.hide()
+                    if hasattr(self, "screen_border") and self.screen_border:
+                        self.screen_border.hide()
                 self.update_tray_state()
 
         threading.Thread(target=_toggle_worker, daemon=True, name="LiveToggleWorker").start()
@@ -1234,12 +1258,19 @@ class VoiceOperatingHubApp:
             if self.is_streaming:
                 self.is_streaming = False
             self.audio_player.stop()
-            self.live_copilot.stop()
+            if self.live_copilot:
+                try:
+                    self.live_copilot.stop()
+                except Exception:
+                    pass
+                self.live_copilot = None
             audio_control.unmute()
 
         self._unregister_hotkeys()
         if hasattr(self, "hud_overlay") and self.hud_overlay:
             self.hud_overlay.stop()
+        if hasattr(self, "screen_border") and self.screen_border:
+            self.screen_border.stop()
         if hasattr(self, "dashboard_gui") and self.dashboard_gui:
             self.dashboard_gui.destroy()
         self.tray_manager.stop()

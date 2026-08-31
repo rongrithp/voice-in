@@ -159,10 +159,11 @@ def test_app_f14_and_f15_reads(app):
 
 
 def test_app_f20_live_toggle(app):
-    with patch.object(app.live_copilot, "toggle", return_value=True) as mock_toggle, \
+    with patch("src.app.LiveCopilotSession.start", return_value=True) as mock_start, \
          patch.object(app.tray_manager, "notify") as mock_notify:
         app.on_f20_live_toggle()
-        mock_toggle.assert_called_once()
+        time.sleep(0.05)
+        mock_start.assert_called_once()
         mock_notify.assert_called_once()
         assert "ACTIVE" in mock_notify.call_args[0][1]
 
@@ -216,10 +217,10 @@ def test_app_f20_and_f13_seamless_switching(app):
     import time
 
     # 1. Start F20 Live Copilot
-    with patch.object(app.live_copilot, "toggle", return_value=True) as mock_live_toggle:
+    with patch("src.app.LiveCopilotSession.start", return_value=True) as mock_live_start:
         app.on_f20_live_toggle()
         time.sleep(0.05)
-        mock_live_toggle.assert_called_once()
+        mock_live_start.assert_called_once()
 
     # 2. While Live is active, user presses F13 -> Live Copilot is automatically stopped before STT starts
     with patch.object(type(app.live_copilot), "is_running", new_callable=PropertyMock, return_value=True), \

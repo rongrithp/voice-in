@@ -120,7 +120,7 @@ async def test_live_copilot_hydrates_system_instruction_with_memory(temp_memory_
     live_config = call_args.kwargs.get("config")
     sys_instruction = live_config.system_instruction.parts[0].text
 
-    assert "Previous Session Context / Rolling Memory" in sys_instruction
+    assert "Previous Context Summary" in sys_instruction
     assert "วางแผน Refactor DB" in sys_instruction
 
 

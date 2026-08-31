@@ -330,8 +330,11 @@ class LiveCopilotSession:
             "Proactively reference relevant context visible on their screen (e.g. code, terminal outputs, error traces, web pages, or active windows) to give immediate, actionable insight."
         )
         if rolling_context:
-            system_instruction_text += f"\n\n[Previous Session Context / Rolling Memory]:\n{rolling_context}"
-            logger.info(f"[LiveMemory] Hydrated system instruction with previous session context.")
+            system_instruction_text += (
+                f"\n\nPrevious Context Summary:\n{rolling_context}\n"
+                "Use this context if the user refers to previous discussion, otherwise focus on current screen."
+            )
+            logger.info("[LiveMemory] Injected short-term session memory into system instruction.")
 
         live_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -567,44 +570,6 @@ class LiveCopilotSession:
                             else:
                                 await session.send(input={"data": jpeg_bytes, "mime_type": "image/jpeg"}, end_of_turn=False)
 
-                            # Floating Screen Vision Preview Window (HUD)
-                            if self.show_preview:
-                                try:
-                                    cv_frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                                    preview_img = cv2.resize(cv_frame, (360, 202), interpolation=cv2.INTER_AREA)
-
-                                    # Draw HUD Header Banner
-                                    cv2.rectangle(preview_img, (0, 0), (360, 24), (20, 20, 20), -1)
-                                    cv2.circle(preview_img, (12, 12), 4, (0, 255, 0), -1)  # Green live dot
-                                    cv2.putText(
-                                        preview_img,
-                                        f"LIVE [Monitor {target_mon_idx}]",
-                                        (22, 16),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.40,
-                                        (0, 255, 0),
-                                        1,
-                                        cv2.LINE_AA
-                                    )
-                                    fps_val = 1.0 / max(0.1, frame_interval)
-                                    cv2.putText(
-                                        preview_img,
-                                        f"{img.width}x{img.height} {fps_val:.2f}FPS",
-                                        (210, 16),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.35,
-                                        (180, 180, 180),
-                                        1,
-                                        cv2.LINE_AA
-                                    )
-
-                                    cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE | cv2.WINDOW_KEEPRATIO)
-                                    cv2.setWindowProperty(win_name, cv2.WND_PROP_TOPMOST, 1)
-                                    cv2.imshow(win_name, preview_img)
-                                    cv2.waitKey(1)
-                                except Exception as hud_err:
-                                    logger.debug(f"[Vision Preview HUD Notice]: {hud_err}")
-
                         except asyncio.CancelledError:
                             break
                         except Exception as ex:
@@ -617,8 +582,7 @@ class LiveCopilotSession:
                         except asyncio.CancelledError:
                             break
                 finally:
-                    if self.show_preview:
-                        _safe_destroy_cv2_windows("Gemini Vision Stream")
+                    pass
 
         async def audio_output_worker(out_stream, active_event: asyncio.Event):
             jitter_buf = bytearray()
