@@ -56,6 +56,58 @@ def sanitize_text(text: str, check_dedup: bool = True) -> str:
 
     return cleaned
 
+class DeltaTextTracker:
+    """
+    Tracks streaming transcription responses, computes delta (new words),
+    and prevents duplicate typing during real-time live streaming.
+    """
+    def __init__(self):
+        self.emitted_text = ""
+
+    def reset(self):
+        self.emitted_text = ""
+
+    def process_incoming_text(self, new_transcription: str) -> str:
+        """
+        Given the latest accumulated or chunk transcription, returns only the newly detected delta text.
+        """
+        if not new_transcription:
+            return ""
+
+        clean_new = sanitize_text(new_transcription, check_dedup=False)
+        if not clean_new:
+            return ""
+
+        # 1. If clean_new extends emitted_text directly
+        if self.emitted_text and clean_new.startswith(self.emitted_text):
+            delta = clean_new[len(self.emitted_text):]
+            self.emitted_text = clean_new
+            return delta
+
+        # 2. If there's partial common prefix overlap
+        if self.emitted_text:
+            common_len = 0
+            min_len = min(len(self.emitted_text), len(clean_new))
+            for i in range(min_len):
+                if self.emitted_text[i] == clean_new[i]:
+                    common_len = i + 1
+                else:
+                    break
+
+            if common_len > len(self.emitted_text) * 0.5:
+                delta = clean_new[common_len:]
+                self.emitted_text = clean_new
+                return delta
+
+        # 3. New segment or brand new phrase
+        delta = clean_new
+        if self.emitted_text and not self.emitted_text.endswith(" "):
+            delta = " " + delta
+
+        self.emitted_text += delta
+        return delta
+
+
 class TextSanitizer:
     """Cleans transcribed text, normalizes Thai Unicode tone marks & vowels, and fixes spacing."""
 

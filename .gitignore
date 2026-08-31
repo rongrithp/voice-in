@@ -1,5 +1,46 @@
+# Environment & Secrets
 .env
+.env.*
+service_account.json
+service_account*.json
+*.pem
+*.key
+
+# Python & Virtual Environments
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .venv/
+venv/
+env/
+ENV/
+
+# Testing & Caching
 .pytest_cache/
+.cache/
+.coverage
+htmlcov/
+
+# Logs & Temporary Data
+*.log
+*.tmp
+data/*.json
+!data/.gitkeep
+
+# Temporary Media / Recordings
+*.wav
+*.pcm
+*.mp3
+debug_*.png
+test_*.png
+test_*.jpg
+
+# Standalone Scratch Scripts
+test_live_screen_and_voice.py
+
+# IDEs & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

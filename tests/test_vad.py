@@ -48,3 +48,19 @@ def test_vad_segmenter_discards_short_speech():
         segments = segmenter.process_pcm_chunk(pcm_510ms)
         # Should be discarded because 150ms < 500ms min duration
         assert len(segments) == 0
+
+def test_vad_segmenter_emit_partial():
+    segmenter = WebRTCVADSegmenter(sample_rate=16000, frame_duration_ms=30, silence_cutoff_ms=500, mode=3, min_speech_duration_ms=250)
+
+    with patch.object(segmenter.vad, "is_speech") as mock_is_speech:
+        segmenter.triggered = True
+        # Simulate active speech frames
+        mock_is_speech.return_value = True
+
+        # Feed 10 frames (300ms) with emit_partial=True (partial_interval_ms=300)
+        pcm_300ms = b"\x00" * (960 * 10)
+        segments = segmenter.process_pcm_chunk(pcm_300ms, emit_partial=True, partial_interval_ms=300)
+
+        # Slices should be yielded immediately without waiting for silence cutoff
+        assert len(segments) == 1
+        assert isinstance(segments[0], np.ndarray)

@@ -38,14 +38,15 @@ class WebRTCVADSegmenter:
         self.silent_duration_ms = 0
         self.ring_buffer.clear()
 
-    def process_pcm_chunk(self, raw_pcm_data: bytes):
+    def process_pcm_chunk(self, raw_pcm_data: bytes, emit_partial: bool = False, partial_interval_ms: int = 300):
         """
-        Processes incoming raw int16 PCM byte stream and yields completed audio segments (np.ndarray float32)
-        when speech end (silence >= silence_cutoff_ms) is detected.
+        Processes incoming raw int16 PCM byte stream and yields completed audio segments (np.ndarray float32).
+        If emit_partial is True, yields ongoing speech slices every partial_interval_ms without waiting for silence cutoff.
         """
         self.bytes_buffer.extend(raw_pcm_data)
 
         completed_segments = []
+        partial_frames_needed = max(1, partial_interval_ms // self.frame_duration_ms)
 
         while len(self.bytes_buffer) >= self.frame_bytes_len:
             frame_bytes = bytes(self.bytes_buffer[:self.frame_bytes_len])
@@ -72,6 +73,14 @@ class WebRTCVADSegmenter:
                 else:
                     self.silent_duration_ms += self.frame_duration_ms
 
+                # If emit_partial is requested and we have accumulated enough voiced frames while speaking
+                if emit_partial and len(self.voiced_frames) >= partial_frames_needed and self.silent_duration_ms < self.silence_cutoff_ms:
+                    pcm_slice = b"".join(self.voiced_frames)
+                    audio_int16 = np.frombuffer(pcm_slice, dtype=np.int16)
+                    audio_float32 = audio_int16.astype(np.float32) / 32768.0
+                    completed_segments.append(audio_float32)
+                    self.voiced_frames.clear()
+
                 if self.silent_duration_ms >= self.silence_cutoff_ms:
                     if self.voiced_frames:
                         pcm_all = b"".join(self.voiced_frames)
@@ -83,7 +92,7 @@ class WebRTCVADSegmenter:
                             # Normalize to float32 [-1.0, 1.0] for faster-whisper
                             audio_float32 = audio_int16.astype(np.float32) / 32768.0
                             completed_segments.append(audio_float32)
-                        else:
+                        elif not emit_partial:
                             speech_sec = max(0.0, speech_samples / self.sample_rate)
                             print(f"[VAD Segmenter] Discarded short noise/speech segment ({speech_sec:.2f}s < {self.min_speech_duration_ms}ms)", flush=True)
 

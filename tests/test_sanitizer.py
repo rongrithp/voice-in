@@ -46,4 +46,25 @@ def test_sanitize_fillers():
     assert sanitizer.sanitize("ก็คือ") == ""
     assert sanitizer.sanitize("อึ๊บ") == ""
 
+def test_delta_text_tracker():
+    from src.sanitizer import DeltaTextTracker
+    tracker = DeltaTextTracker()
+
+    # Step 1: First word
+    delta1 = tracker.process_incoming_text("สวัสดี")
+    assert delta1 == "สวัสดี"
+
+    # Step 2: Extended partial response
+    delta2 = tracker.process_incoming_text("สวัสดีครับ ผมกำลังทดสอบ")
+    assert "ผมกำลังทดสอบ" in delta2
+
+    # Step 3: Same text again yields empty delta
+    delta3 = tracker.process_incoming_text("สวัสดีครับ ผมกำลังทดสอบ")
+    assert delta3 == ""
+
+    # Step 4: Reset tracker
+    tracker.reset()
+    delta4 = tracker.process_incoming_text("ข้อความใหม่")
+    assert delta4 == "ข้อความใหม่"
+
 

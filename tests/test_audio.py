@@ -37,3 +37,58 @@ def test_audio_buffer_overflow():
     assert np.array_equal(item2, c3)
     item3 = buffer.get(timeout=0.1)
     assert np.array_equal(item3, c4)
+
+def test_is_audio_driver_error():
+    from src.audio import is_audio_driver_error
+    import sounddevice as sd
+
+    assert is_audio_driver_error(sd.PortAudioError("Error code -9999: Unanticipated host error")) is True
+    assert is_audio_driver_error(OSError("MME error 6")) is True
+    assert is_audio_driver_error(RuntimeError("PyAudio device unavailable")) is True
+    assert is_audio_driver_error(ValueError("random value error")) is False
+
+def test_robust_audio_stream_capture_recovery():
+    from unittest.mock import patch, MagicMock
+    from src.audio import robust_audio_stream_capture
+
+    attempts = 0
+    def mock_read(size):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("Error code -9999: Unanticipated host error")
+        return (b"\x00\x00" * 480, False)
+
+    mock_stream = MagicMock()
+    mock_stream.read.side_effect = mock_read
+
+    call_count = 0
+    def is_active():
+        nonlocal call_count
+        call_count += 1
+        return call_count <= 6
+
+    with patch("src.audio.sd.RawInputStream", return_value=mock_stream):
+        generator = robust_audio_stream_capture(
+            is_active_callback=is_active,
+            retry_delay=0.01
+        )
+        chunks = list(generator)
+        assert len(chunks) >= 1
+        assert attempts >= 2
+
+def test_live_audio_stream_producer():
+    from unittest.mock import patch, MagicMock
+    import time
+    from src.audio import LiveAudioStreamProducer
+
+    mock_stream = MagicMock()
+    mock_stream.read.return_value = (b"\x00\x00" * 480, False)
+
+    with patch("src.audio.sd.RawInputStream", return_value=mock_stream):
+        producer = LiveAudioStreamProducer(sample_rate=16000, channels=1, frame_ms=30)
+        producer.start()
+        time.sleep(0.005)
+        producer.stop()
+
+        assert producer.is_active is False
