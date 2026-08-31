@@ -115,7 +115,7 @@ class HUDOverlay:
             self.root.title("VoiceHubHUD")
             self.root.overrideredirect(True)
             self.root.attributes("-topmost", True)
-            self.root.attributes("-alpha", 0.98)
+            self.root.attributes("-alpha", 1.0)
             self.root.configure(bg="#050505")
 
             # Click-through and non-activating window attributes on Windows OS
@@ -212,14 +212,14 @@ class HUDOverlay:
 
             if self.position == "top-right":
                 x = mon_left + mon_width - w - 24
-                y = mon_top + 20
+                y = mon_top + 25
             else: # top-center: (3440 - 380) // 2 = 1530
                 x = mon_left + (mon_width - w) // 2
-                y = mon_top + 20
+                y = mon_top + 25
 
             self.root.geometry(f"{w}x{h}+{x}+{y}")
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.debug(f"[HUD Reposition Notice]: {ex}")
 
     def _schedule_pulse(self):
         """Dynamic border pulsing animation while active to catch peripheral vision."""
@@ -299,14 +299,22 @@ class HUDOverlay:
                 if self._label:
                     self._label.configure(text=txt, bg=cfg["bg"], fg=cfg["fg"])
 
-                if not self._is_visible:
-                    self.root.deiconify()
-                    self._is_visible = True
-                
+                self._reposition()
+                self.root.deiconify()
                 self.root.attributes("-topmost", True)
+                self.root.attributes("-alpha", 1.0)
                 self.root.lift()
                 self._force_click_through_and_topmost()
-                self._reposition()
+                self._is_visible = True
+                
+                # Force immediate Tkinter layout calculation & Win32 DWM paint pump
+                try:
+                    self.root.update_idletasks()
+                    self.root.update()
+                except Exception:
+                    pass
+
+                logger.info(f"[HUD Overlay] Deiconified state -> {state.value} ('{txt}')")
         except Exception as e:
             logger.debug(f"[HUD Apply Notice] {e}")
 
