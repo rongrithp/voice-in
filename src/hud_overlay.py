@@ -15,30 +15,33 @@ class HUDState(enum.Enum):
 
 STATE_CONFIGS = {
     HUDState.STT_ACTIVE: {
-        "text": "🔴 STT LISTENING...",
-        "bg": "#c0392b",
+        "text": "🔴 [LIVE UPLOADING] STT ACTIVE • MIC ON",
+        "bg": "#8b0000",
         "fg": "#ffffff",
-        "border": "#e74c3c",
+        "border": "#ff3333",
     },
     HUDState.LIVE_ACTIVE: {
-        "text": "🟢 GEMINI LIVE CONNECTED",
-        "bg": "#1e824c",
+        "text": "🟢 [STREAMING DATA] GEMINI LIVE • MIC & VISION ACTIVE",
+        "bg": "#0e5a2c",
         "fg": "#ffffff",
-        "border": "#2ecc71",
+        "border": "#00e676",
     },
     HUDState.TTS_ACTIVE: {
-        "text": "🔊 TTS READING...",
-        "bg": "#2980b9",
+        "text": "🔊 [PLAYBACK ACTIVE] TTS READING...",
+        "bg": "#104e8b",
         "fg": "#ffffff",
-        "border": "#3498db",
+        "border": "#00bfff",
     },
 }
+
+VU_LEVELS = ["▱▱▱▱", "▰▱▱▱", "▰▰▱▱", "▰▰▰▱", "▰▰▰▰"]
 
 class HUDOverlay:
     """
     Ultra-lightweight, frameless, topmost, click-through On-Screen Floating Pill HUD.
-    Displays vibrant visual indicator at the top of the screen whenever STT (F13)
-    or Gemini Live Co-pilot (F20) is actively ingesting audio to prevent billing waste.
+    Displays prominent real-time data transmission and audio ingestion indicators at the top
+    of the screen whenever STT (F13) or Gemini Live Co-pilot (F20) is actively uploading audio.
+    Guarantees 100% visibility to prevent unintended API billing waste.
     """
 
     def __init__(self, position: str = "top-center"):
@@ -53,6 +56,8 @@ class HUDOverlay:
         self._thread: Optional[threading.Thread] = None
         self._pulse_job = None
         self._pulse_toggle = False
+        self._current_rms = 0.0
+        self._last_ui_update_time = 0.0
 
     def start(self):
         """Starts the HUD overlay in a dedicated daemon thread."""
@@ -69,8 +74,8 @@ class HUDOverlay:
             self.root.title("VoiceHubHUD")
             self.root.overrideredirect(True)
             self.root.attributes("-topmost", True)
-            self.root.attributes("-alpha", 0.95)
-            self.root.configure(bg="#111111")
+            self.root.attributes("-alpha", 0.96)
+            self.root.configure(bg="#0a0a0a")
 
             # Click-through and non-activating window attributes on Windows OS
             try:
@@ -90,13 +95,13 @@ class HUDOverlay:
             except Exception as ex:
                 logger.debug(f"[HUD ClickThrough Notice] {ex}")
 
-            # Pill container
+            # Pill container frame with high-contrast glowing border
             self._pill_frame = tk.Frame(
                 self.root,
                 bg="#1a1a1a",
                 highlightthickness=2,
                 highlightbackground="#333333",
-                padx=16,
+                padx=18,
                 pady=6
             )
             self._pill_frame.pack(fill="both", expand=True)
@@ -131,8 +136,8 @@ class HUDOverlay:
         try:
             self.root.update_idletasks()
             sw = self.root.winfo_screenwidth()
-            w = max(260, self.root.winfo_reqwidth() + 20)
-            h = max(40, self.root.winfo_reqheight() + 10)
+            w = max(380, self.root.winfo_reqwidth() + 24)
+            h = max(42, self.root.winfo_reqheight() + 10)
             
             if self.position == "top-right":
                 x = sw - w - 24
@@ -146,7 +151,7 @@ class HUDOverlay:
             pass
 
     def _schedule_pulse(self):
-        """Micro-pulse effect on the active indicator to catch peripheral vision."""
+        """Dynamic border pulsing animation while data transmission is active."""
         if not self.root or not self._is_running:
             return
         try:
@@ -158,7 +163,45 @@ class HUDOverlay:
                     self._pill_frame.configure(highlightbackground=border_color)
         except Exception:
             pass
-        self._pulse_job = self.root.after(600, self._schedule_pulse)
+        self._pulse_job = self.root.after(500, self._schedule_pulse)
+
+    def update_audio_level(self, rms: float):
+        """Updates live audio RMS level and reflects real-time audio transmission on HUD."""
+        self._current_rms = rms
+        now = time.perf_counter()
+        if now - self._last_ui_update_time < 0.10:  # Throttle to max 10 FPS for ultra-smooth UI
+            return
+        self._last_ui_update_time = now
+
+        if not self.root or not self._is_running or not self._is_visible:
+            return
+
+        # Calculate VU meter level (0 to 4)
+        if rms < 150.0:
+            vu_idx = 0
+        elif rms < 500.0:
+            vu_idx = 1
+        elif rms < 1500.0:
+            vu_idx = 2
+        elif rms < 3000.0:
+            vu_idx = 3
+        else:
+            vu_idx = 4
+
+        vu_meter = VU_LEVELS[vu_idx]
+        self.root.after(0, lambda: self._apply_audio_level(vu_meter))
+
+    def _apply_audio_level(self, vu_meter: str):
+        if not self.root or not self._is_running or not self._is_visible:
+            return
+        try:
+            if self.state in STATE_CONFIGS:
+                cfg = STATE_CONFIGS[self.state]
+                txt = f"{cfg['text']}  {vu_meter}"
+                if self._label:
+                    self._label.configure(text=txt)
+        except Exception:
+            pass
 
     def set_state(self, state: HUDState, custom_text: Optional[str] = None):
         """Thread-safe state update."""
@@ -195,11 +238,11 @@ class HUDOverlay:
             logger.debug(f"[HUD Apply Notice] {e}")
 
     def show_stt(self):
-        """Displays prominent red STT recording pill."""
+        """Displays prominent red STT data uploading pill."""
         self.set_state(HUDState.STT_ACTIVE)
 
     def show_live(self):
-        """Displays prominent green Gemini Live streaming pill."""
+        """Displays prominent green Gemini Live streaming data pill."""
         self.set_state(HUDState.LIVE_ACTIVE)
 
     def show_tts(self):

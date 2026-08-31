@@ -54,10 +54,10 @@ An ultra-low latency, high-performance, two-way Windows voice operating hub daem
 ## 🎨 Visual Indicator States
 
 ### On-Screen Floating HUD Pill (`src/hud_overlay.py`)
-Placed at the top-center of the primary screen:
-- **`🔴 STT LISTENING...`** : Google Cloud Speech STT is currently streaming audio.
-- **`🟢 GEMINI LIVE CONNECTED`** : Gemini Live Multimodal Co-pilot is actively connected.
-- **`🔊 TTS READING...`** : Text-to-Speech audio is playing.
+Placed at the top-center of the primary screen with 100% click-through and zero focus stealing:
+- **`🔴 [LIVE UPLOADING] STT ACTIVE • MIC ON  ▰▰▰▰`** : Google Cloud Speech STT gRPC is actively streaming PCM audio chunks with real-time VU level activity.
+- **`🟢 [STREAMING DATA] GEMINI LIVE • MIC & VISION ACTIVE`** : Gemini Multimodal Live Co-pilot is actively connected with bidirectional audio & screen stream.
+- **`🔊 [PLAYBACK ACTIVE] TTS READING...`** : Text-to-Speech audio playback is active.
 - **Hidden / IDLE** : Window is completely hidden when no audio transmission is active.
 
 ### System Tray Status Badge (`src/tray_manager.py`)

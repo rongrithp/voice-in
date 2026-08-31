@@ -167,6 +167,7 @@ class LiveCopilotSession:
         self._speaker_stream = None
         self.memory = LiveSessionMemory()
         self._session_transcript: list[dict[str, Any]] = []
+        self.on_audio_level = None
 
         # Instant reference to pre-warmed client if already ready
         if _GLOBAL_LIVE_CLIENT is not None:
@@ -384,6 +385,12 @@ class LiveCopilotSession:
                     int16_arr = np.frombuffer(raw_bytes, dtype=np.int16)
                     rms = float(np.sqrt(np.mean(int16_arr.astype(np.float32)**2))) if len(int16_arr) > 0 else 0.0
                     current_threshold = float(getattr(self, "noise_threshold", getattr(config, "GEMINI_LIVE_RMS_THRESHOLD", 2500.0)))
+
+                    if hasattr(self, "on_audio_level") and self.on_audio_level:
+                        try:
+                            self.on_audio_level(rms)
+                        except Exception:
+                            pass
 
                     if rms >= current_threshold:
                         active_speech_counter += 1

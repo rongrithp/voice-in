@@ -81,3 +81,22 @@ def test_hud_overlay_stop():
     hud.stop()
     assert hud._is_running is False
     assert hud.root is None
+
+def test_hud_overlay_audio_level():
+    hud = HUDOverlay()
+    mock_root = MagicMock()
+    hud.root = mock_root
+    hud._is_running = True
+    hud._is_visible = True
+    hud.state = HUDState.STT_ACTIVE
+    hud._label = MagicMock()
+
+    hud.update_audio_level(2500.0)
+    mock_root.after.assert_called()
+
+    # Direct apply level
+    hud._apply_audio_level("▰▰▰▱")
+    call_text = hud._label.configure.call_args.kwargs.get("text", "")
+    assert "🔴 [LIVE UPLOADING] STT ACTIVE • MIC ON" in call_text
+    assert "▰▰▰▱" in call_text
+

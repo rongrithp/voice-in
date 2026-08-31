@@ -163,6 +163,7 @@ class VoiceOperatingHubApp:
         )
         # On-Screen Floating Pill HUD Overlay
         self.hud_overlay = HUDOverlay(position="top-center")
+        self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
 
         if start_gui:
             self.dashboard_gui.start_in_thread()
@@ -575,6 +576,8 @@ class VoiceOperatingHubApp:
                 rms = calculate_rms(pcm_array)
                 if hasattr(self, "dashboard_gui") and self.dashboard_gui:
                     self.dashboard_gui.update_audio_level(rms)
+                if hasattr(self, "hud_overlay") and self.hud_overlay:
+                    self.hud_overlay.update_audio_level(rms)
 
                 # Real-Time WebSocket Streaming Mode (when active_live_session is started)
                 if self.active_live_session:

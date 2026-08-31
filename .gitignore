@@ -43,4 +43,5 @@ test_live_screen_and_voice.py
 .idea/
 .DS_Store
 Thumbs.db
+*.lnk
 
