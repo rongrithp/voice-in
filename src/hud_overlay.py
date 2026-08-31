@@ -13,8 +13,10 @@ class HUDState(enum.Enum):
     STT_ACTIVE = "stt_active"
     STT_FINALIZING = "stt_finalizing"
     LIVE_CONNECTING = "live_connecting"
+    LIVE_HANDSHAKE = "live_handshake"
     LIVE_ACTIVE = "live_active"
     LIVE_CLOSING = "live_closing"
+    LIVE_ERROR = "live_error"
     TTS_ACTIVE = "tts_active"
 
 STATE_CONFIGS = {
@@ -37,7 +39,13 @@ STATE_CONFIGS = {
         "border": "#ffffff",
     },
     HUDState.LIVE_CONNECTING: {
-        "text": "🟡 CONNECTING MODEL...",
+        "text": "🟡 [1/2] CONNECTING TO GEMINI SERVER...",
+        "bg": "#111111",
+        "fg": "#fbbf24",
+        "border": "#f59e0b",
+    },
+    HUDState.LIVE_HANDSHAKE: {
+        "text": "🟡 [2/2] INITIALIZING MODEL & MEMORY...",
         "bg": "#111111",
         "fg": "#fb923c",
         "border": "#f97316",
@@ -54,6 +62,12 @@ STATE_CONFIGS = {
         "fg": "#cbd5e1",
         "border": "#94a3b8",
     },
+    HUDState.LIVE_ERROR: {
+        "text": "🔴 CONNECTION FAILED • RETRYING...",
+        "bg": "#111111",
+        "fg": "#ffffff",
+        "border": "#ef4444",
+    },
     HUDState.TTS_ACTIVE: {
         "text": "🔊 READING...",
         "bg": "#111111",
@@ -67,7 +81,7 @@ VU_LEVELS = ["▱▱▱▱", "▰▱▱▱", "▰▰▱▱", "▰▰▰▱", "�
 class HUDOverlay:
     """
     Ultra-lightweight, frameless, topmost, click-through On-Screen Floating Pill HUD.
-    Displays streamlined real-time connection status and live audio ingestion meters
+    Displays granular real-time connection status and live audio ingestion meters
     at top-center of Monitor 1 (UltraWide 3440x1440).
     """
 
@@ -176,7 +190,7 @@ class HUDOverlay:
         if not self.root:
             return
         try:
-            w = 360
+            w = 380
             h = 42
 
             # Resolve Monitor 1 dimensions (Default: UltraWide 3440x1440 at 0,0)
@@ -199,7 +213,7 @@ class HUDOverlay:
             if self.position == "top-right":
                 x = mon_left + mon_width - w - 24
                 y = mon_top + 20
-            else: # top-center: (3440 - 360) // 2 = 1540
+            else: # top-center: (3440 - 380) // 2 = 1530
                 x = mon_left + (mon_width - w) // 2
                 y = mon_top + 20
 
@@ -296,7 +310,7 @@ class HUDOverlay:
         except Exception as e:
             logger.debug(f"[HUD Apply Notice] {e}")
 
-    # --- Simplified Helper Methods ---
+    # --- Granular Lifecycle Helper Methods ---
 
     def show_stt_connecting(self):
         """🟡 CONNECTING..."""
@@ -311,8 +325,12 @@ class HUDOverlay:
         self.set_state(HUDState.STT_FINALIZING)
 
     def show_live_connecting(self):
-        """🟡 CONNECTING MODEL..."""
+        """🟡 [1/2] CONNECTING TO GEMINI SERVER..."""
         self.set_state(HUDState.LIVE_CONNECTING)
+
+    def show_live_handshake(self):
+        """🟡 [2/2] INITIALIZING MODEL & MEMORY..."""
+        self.set_state(HUDState.LIVE_HANDSHAKE)
 
     def show_live(self):
         """🟢 READY • SPEAK NOW"""
@@ -321,6 +339,12 @@ class HUDOverlay:
     def show_live_closing(self):
         """⚪ CLOSING..."""
         self.set_state(HUDState.LIVE_CLOSING)
+
+    def show_live_error(self, auto_hide_seconds: float = 2.0):
+        """🔴 CONNECTION FAILED • RETRYING..."""
+        self.set_state(HUDState.LIVE_ERROR)
+        if self.root and auto_hide_seconds > 0:
+            self.root.after(int(auto_hide_seconds * 1000), self.hide)
 
     def show_tts(self):
         """🔊 READING..."""

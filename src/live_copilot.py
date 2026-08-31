@@ -193,7 +193,9 @@ class LiveCopilotSession:
         self.memory = LiveSessionMemory()
         self._session_transcript: list[dict[str, Any]] = []
         self.on_audio_level = None
+        self.on_handshake = None
         self.on_connected = None
+        self.on_error = None
 
         # Instant reference to pre-warmed client if already ready
         if _GLOBAL_LIVE_CLIENT is not None:
@@ -764,6 +766,11 @@ class LiveCopilotSession:
                             break
                         try:
                             logger.info(f"[LiveCopilot] Sending handshake to {target_model}...")
+                            if hasattr(self, "on_handshake") and self.on_handshake:
+                                try:
+                                    self.on_handshake()
+                                except Exception:
+                                    pass
                             conn_ctx = client.aio.live.connect(model=target_model, config=live_config)
                             session = await asyncio.wait_for(conn_ctx.__aenter__(), timeout=5.0)
                             try:
@@ -827,6 +834,13 @@ class LiveCopilotSession:
                                     await asyncio.sleep(0.5)
                                 except (asyncio.CancelledError, RuntimeError):
                                     break
+
+                    if not connected and not self._stop_event.is_set() and self._is_running:
+                        if hasattr(self, "on_error") and self.on_error:
+                            try:
+                                self.on_error()
+                            except Exception:
+                                pass
 
                     self._is_connected = False
                     _clear_queues()

@@ -1005,6 +1005,12 @@ class VoiceOperatingHubApp:
 
     def on_f20_live_toggle(self):
         """Toggle Gemini Multimodal Live Co-pilot streaming session (F20) asynchronously."""
+        # Low-Latency Immediate Visual Trigger: show connecting state in 0ms on the caller thread
+        is_currently_running = bool(self.live_copilot and self.live_copilot.is_running)
+        if not is_currently_running:
+            if hasattr(self, "hud_overlay") and self.hud_overlay:
+                self.hud_overlay.show_live_connecting()
+
         def _toggle_worker():
             try:
                 # If STT recording is currently active, stop it first to free the mic
@@ -1013,19 +1019,17 @@ class VoiceOperatingHubApp:
                     self.toggle_stt()
                     time.sleep(0.02)
 
-                is_currently_running = bool(self.live_copilot and self.live_copilot.is_running)
-
                 if not is_currently_running:
                     # 1. Fresh Session Re-instantiation: guarantees clean state & hydrates Short-term Memory
                     cur_mon = getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
                     self.live_copilot = LiveCopilotSession(target_monitor=cur_mon)
                     self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
-                    self.live_copilot.on_connected = lambda: self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None
-
-                    if hasattr(self, "hud_overlay") and self.hud_overlay:
-                        self.hud_overlay.show_live_connecting()
-                    if hasattr(self, "screen_border") and self.screen_border:
-                        self.screen_border.show()
+                    self.live_copilot.on_handshake = lambda: self.hud_overlay.show_live_handshake() if hasattr(self, "hud_overlay") and self.hud_overlay else None
+                    self.live_copilot.on_connected = lambda: (
+                        self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None,
+                        self.screen_border.show() if hasattr(self, "screen_border") and self.screen_border else None
+                    )
+                    self.live_copilot.on_error = lambda: self.hud_overlay.show_live_error() if hasattr(self, "hud_overlay") and self.hud_overlay else None
 
                     is_active = self.live_copilot.start()
                 else:
@@ -1049,9 +1053,11 @@ class VoiceOperatingHubApp:
                 self.tray_manager.notify("Gemini Live Co-pilot", f"Live Session: {status_str}")
             except Exception as ex:
                 logger.error(f"[Live Co-pilot Error] Failed to toggle live session: {ex}")
+                if hasattr(self, "hud_overlay") and self.hud_overlay:
+                    self.hud_overlay.show_live_error()
             finally:
                 if not (self.live_copilot and self.live_copilot.is_running) and not self.is_streaming:
-                    if hasattr(self, "hud_overlay") and self.hud_overlay:
+                    if hasattr(self, "hud_overlay") and self.hud_overlay and self.hud_overlay.state != HUDState.LIVE_ERROR:
                         self.hud_overlay.hide()
                     if hasattr(self, "screen_border") and self.screen_border:
                         self.screen_border.hide()

@@ -34,16 +34,26 @@ def test_hud_overlay_states_and_transitions():
     hud._apply_state(HUDState.STT_FINALIZING)
     assert "FINALIZING" in hud._label.configure.call_args.kwargs["text"]
 
-    # 2. Test Live Gemini Connecting & Active & Closing States
+    # 2. Test Live Gemini Connecting, Handshake, Active, Error, Closing States
     hud.show_live_connecting()
     assert hud.state == HUDState.LIVE_CONNECTING
     hud._apply_state(HUDState.LIVE_CONNECTING)
-    assert "CONNECTING MODEL" in hud._label.configure.call_args.kwargs["text"]
+    assert "[1/2] CONNECTING" in hud._label.configure.call_args.kwargs["text"]
+
+    hud.show_live_handshake()
+    assert hud.state == HUDState.LIVE_HANDSHAKE
+    hud._apply_state(HUDState.LIVE_HANDSHAKE)
+    assert "[2/2] INITIALIZING" in hud._label.configure.call_args.kwargs["text"]
 
     hud.show_live()
     assert hud.state == HUDState.LIVE_ACTIVE
     hud._apply_state(HUDState.LIVE_ACTIVE)
     assert "🟢 READY • SPEAK NOW" in hud._label.configure.call_args.kwargs["text"]
+
+    hud.show_live_error()
+    assert hud.state == HUDState.LIVE_ERROR
+    hud._apply_state(HUDState.LIVE_ERROR)
+    assert "CONNECTION FAILED" in hud._label.configure.call_args.kwargs["text"]
 
     hud.show_live_closing()
     assert hud.state == HUDState.LIVE_CLOSING
