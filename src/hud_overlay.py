@@ -20,45 +20,45 @@ class HUDState(enum.Enum):
 STATE_CONFIGS = {
     HUDState.STT_CONNECTING: {
         "text": "🟡 [STT] CONNECTING TO GOOGLE CLOUD...",
-        "bg": "#1a1a1a",
-        "fg": "#f1c40f",
-        "border": "#f1c40f",
+        "bg": "#111111",
+        "fg": "#fbbf24",
+        "border": "#f59e0b",
     },
     HUDState.STT_ACTIVE: {
         "text": "🔴 [STT STREAMING] MIC ON • SPEAK NOW",
-        "bg": "#1a1a1a",
+        "bg": "#111111",
         "fg": "#ffffff",
-        "border": "#ff3333",
+        "border": "#ef4444",
     },
     HUDState.STT_FINALIZING: {
         "text": "⚪ [STT] INJECTING & FINALIZING...",
-        "bg": "#1a1a1a",
-        "fg": "#e0e0e0",
+        "bg": "#111111",
+        "fg": "#f8fafc",
         "border": "#ffffff",
     },
     HUDState.LIVE_CONNECTING: {
         "text": "🟡 [GEMINI LIVE] CONNECTING TO MODEL (HANDSHAKE)...",
-        "bg": "#1a1a1a",
-        "fg": "#f39c12",
-        "border": "#f39c12",
+        "bg": "#111111",
+        "fg": "#fb923c",
+        "border": "#f97316",
     },
     HUDState.LIVE_ACTIVE: {
         "text": "🟢 [GEMINI LIVE] CONNECTED • SCREEN (MON 1) & VOICE READY",
-        "bg": "#1a1a1a",
+        "bg": "#111111",
         "fg": "#ffffff",
-        "border": "#00e676",
+        "border": "#10b981",
     },
     HUDState.LIVE_CLOSING: {
         "text": "⚪ [GEMINI LIVE] CLOSING SESSION...",
-        "bg": "#1a1a1a",
-        "fg": "#bdc3c7",
-        "border": "#bdc3c7",
+        "bg": "#111111",
+        "fg": "#cbd5e1",
+        "border": "#94a3b8",
     },
     HUDState.TTS_ACTIVE: {
         "text": "🔊 [TTS READING] HIGH-FIDELITY PLAYBACK ACTIVE",
-        "bg": "#1a1a1a",
+        "bg": "#111111",
         "fg": "#ffffff",
-        "border": "#00bfff",
+        "border": "#06b6d4",
     },
 }
 
@@ -67,7 +67,7 @@ VU_LEVELS = ["▱▱▱▱", "▰▱▱▱", "▰▰▱▱", "▰▰▰▱", "�
 class HUDOverlay:
     """
     Ultra-lightweight, frameless, topmost, click-through On-Screen Floating Pill HUD.
-    Displays granular real-time connection lifecycle states and live audio ingestion meters
+    Displays prominent real-time connection lifecycle states and live audio ingestion meters
     at the top-center of Monitor 1 (UltraWide 3440x1440) whenever STT (F13) or Gemini Live (F20)
     is active. Guarantees 100% visibility to prevent unintended API billing waste.
     """
@@ -102,8 +102,8 @@ class HUDOverlay:
             self.root.title("VoiceHubHUD")
             self.root.overrideredirect(True)
             self.root.attributes("-topmost", True)
-            self.root.attributes("-alpha", 0.96)
-            self.root.configure(bg="#0a0a0a")
+            self.root.attributes("-alpha", 0.98)
+            self.root.configure(bg="#050505")
 
             # Click-through and non-activating window attributes on Windows OS
             self._force_click_through_and_topmost()
@@ -111,19 +111,19 @@ class HUDOverlay:
             # Pill container frame with high-contrast glowing border
             self._pill_frame = tk.Frame(
                 self.root,
-                bg="#1a1a1a",
-                highlightthickness=2,
+                bg="#111111",
+                highlightthickness=3,
                 highlightbackground="#333333",
-                padx=20,
-                pady=7
+                padx=24,
+                pady=8
             )
             self._pill_frame.pack(fill="both", expand=True)
 
             self._label = tk.Label(
                 self._pill_frame,
                 text="● READY",
-                font=("Segoe UI", 11, "bold"),
-                bg="#1a1a1a",
+                font=("Segoe UI", 12, "bold"),
+                bg="#111111",
                 fg="#ffffff",
                 padx=8,
                 pady=2
@@ -143,7 +143,7 @@ class HUDOverlay:
             self._is_running = False
 
     def _force_click_through_and_topmost(self):
-        """Applies Win32 WS_EX_TRANSPARENT, WS_EX_NOACTIVATE and HWND_TOPMOST."""
+        """Applies Win32 WS_EX_TRANSPARENT, WS_EX_NOACTIVATE and HWND_TOPMOST without clobbering alpha."""
         if not self.root:
             return
         try:
@@ -153,15 +153,12 @@ class HUDOverlay:
             import ctypes
             GWL_EXSTYLE = -20
             WS_EX_TRANSPARENT = 0x00000020
-            WS_EX_LAYERED = 0x00080000
             WS_EX_TOOLWINDOW = 0x00000080
             WS_EX_NOACTIVATE = 0x08000000
             
-            ctypes.windll.user32.SetWindowLongW(
-                hwnd,
-                GWL_EXSTYLE,
-                WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-            )
+            old_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            new_style = old_style | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
 
             HWND_TOPMOST = -1
             SWP_NOSIZE = 0x0001
@@ -181,8 +178,8 @@ class HUDOverlay:
             return
         try:
             self.root.update_idletasks()
-            w = max(420, self.root.winfo_reqwidth() + 28)
-            h = max(44, self.root.winfo_reqheight() + 10)
+            w = max(480, self.root.winfo_reqwidth() + 32)
+            h = max(48, self.root.winfo_reqheight() + 12)
 
             # Resolve Monitor 1 dimensions (Default: UltraWide 3440x1440 at 0,0)
             mon1 = None
@@ -206,10 +203,10 @@ class HUDOverlay:
 
             if self.position == "top-right":
                 x = mon_left + mon_width - w - 24
-                y = mon_top + 20
+                y = mon_top + 30
             else: # top-center
                 x = mon_left + (mon_width - w) // 2
-                y = mon_top + 20
+                y = mon_top + 30
 
             self.root.geometry(f"{w}x{h}+{x}+{y}")
         except Exception:
@@ -223,7 +220,7 @@ class HUDOverlay:
             if self._is_visible and self.state in STATE_CONFIGS:
                 cfg = STATE_CONFIGS[self.state]
                 self._pulse_toggle = not self._pulse_toggle
-                border_color = cfg["border"] if self._pulse_toggle else "#2a2a2a"
+                border_color = cfg["border"] if self._pulse_toggle else "#222222"
                 if self._pill_frame:
                     self._pill_frame.configure(highlightbackground=border_color)
         except Exception:
