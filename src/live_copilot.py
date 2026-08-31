@@ -133,6 +133,25 @@ def sound_feedback(freq: int, ms: int):
     threading.Thread(target=_beep, daemon=True).start()
 
 
+def _safe_destroy_cv2_windows(win_name: Optional[str] = "Gemini Vision Stream"):
+    """
+    Safely and completely closes OpenCV preview windows on Windows OS.
+    Pumps cv2.waitKey(1) multiple times to flush the Win32 message queue (WM_DESTROY / WM_NCDESTROY)
+    and guarantee the window is fully disposed without hanging the process or blocking GUI threads.
+    """
+    try:
+        if win_name:
+            try:
+                cv2.destroyWindow(win_name)
+            except Exception:
+                pass
+        cv2.destroyAllWindows()
+        for _ in range(5):
+            cv2.waitKey(1)
+    except Exception as e:
+        logger.debug(f"[LiveCopilot] OpenCV window cleanup notice: {e}")
+
+
 class LiveCopilotSession:
     """
     Multimodal Live Co-pilot Session Controller.
@@ -238,10 +257,7 @@ class LiveCopilotSession:
             self._worker_thread = None
 
         if self.show_preview:
-            try:
-                cv2.destroyAllWindows()
-            except Exception:
-                pass
+            _safe_destroy_cv2_windows("Gemini Vision Stream")
 
         if thread_to_join and thread_to_join.is_alive() and threading.current_thread() != thread_to_join:
             thread_to_join.join(timeout=0.3)
@@ -267,6 +283,8 @@ class LiveCopilotSession:
         finally:
             self._is_running = False
             self._is_connected = False
+            if self.show_preview:
+                _safe_destroy_cv2_windows("Gemini Vision Stream")
             self._flush_memory_snapshot()
 
     def _resolve_client(self):
@@ -599,10 +617,7 @@ class LiveCopilotSession:
                             break
                 finally:
                     if self.show_preview:
-                        try:
-                            cv2.destroyAllWindows()
-                        except Exception:
-                            pass
+                        _safe_destroy_cv2_windows("Gemini Vision Stream")
 
         async def audio_output_worker(out_stream, active_event: asyncio.Event):
             jitter_buf = bytearray()

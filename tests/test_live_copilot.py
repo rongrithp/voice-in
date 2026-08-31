@@ -949,4 +949,23 @@ def test_live_copilot_stop_device_cleanup():
     assert session._stop_event.is_set() is True
 
 
+def test_live_copilot_opencv_window_cleanup():
+    """Verify that stop() calls _safe_destroy_cv2_windows with waitKey pumping to dispose window handles."""
+    from src.live_copilot import _safe_destroy_cv2_windows
+    with patch("cv2.destroyWindow") as mock_dest_win, \
+         patch("cv2.destroyAllWindows") as mock_dest_all, \
+         patch("cv2.waitKey") as mock_wait_key:
+        _safe_destroy_cv2_windows("Gemini Vision Stream")
+        mock_dest_win.assert_called_once_with("Gemini Vision Stream")
+        mock_dest_all.assert_called_once()
+        assert mock_wait_key.call_count >= 5
+
+    session = LiveCopilotSession(show_preview=True)
+    session._is_running = True
+    with patch("src.live_copilot._safe_destroy_cv2_windows") as mock_cleanup:
+        session.stop()
+        mock_cleanup.assert_called_with("Gemini Vision Stream")
+
+
+
 
