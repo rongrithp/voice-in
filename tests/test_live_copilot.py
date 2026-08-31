@@ -967,5 +967,43 @@ def test_live_copilot_opencv_window_cleanup():
         mock_cleanup.assert_called_with("Gemini Vision Stream")
 
 
+def test_live_copilot_stop_purges_audio_streams_and_tasks():
+    """Verify that stop() forcefully closes speaker/mic streams, purges audio queues, and cancels tasks."""
+    import asyncio
+    session = LiveCopilotSession()
+    session._is_running = True
+
+    mock_speaker = MagicMock()
+    mock_mic = MagicMock()
+    session._speaker_stream = mock_speaker
+    session._mic_stream = mock_mic
+
+    mock_out_q = asyncio.Queue()
+    mock_out_q.put_nowait(b"audio_chunk_1")
+    mock_out_q.put_nowait(b"audio_chunk_2")
+    session._audio_out_queue = mock_out_q
+
+    mock_loop = MagicMock()
+    mock_loop.is_running.return_value = True
+    mock_task = MagicMock()
+    mock_task.done.return_value = False
+    session._async_loop = mock_loop
+    session._worker_tasks = [mock_task]
+
+    session.stop()
+
+    # Verify stream closure
+    mock_speaker.close.assert_called_once()
+    mock_mic.close.assert_called_once()
+    assert session._speaker_stream is None
+    assert session._mic_stream is None
+
+    # Verify queue purge
+    assert mock_out_q.empty() is True
+
+    # Verify task cancellation & loop stop
+    assert mock_loop.call_soon_threadsafe.called is True
+
+
 
 

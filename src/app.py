@@ -1057,6 +1057,14 @@ class VoiceOperatingHubApp:
                         time.sleep(0.02)
 
                     if not is_currently_running:
+                        # 0. Ensure any orphan session is 100% stopped and purged before allocating a new one
+                        if hasattr(self, "live_copilot") and self.live_copilot is not None:
+                            try:
+                                self.live_copilot.stop()
+                            except Exception:
+                                pass
+                            self.live_copilot = None
+
                         # 1. Fresh Session Re-instantiation: guarantees clean state & hydrates Short-term Memory
                         cur_mon = getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
                         self.live_copilot = LiveCopilotSession(target_monitor=cur_mon)

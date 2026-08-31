@@ -190,6 +190,10 @@ class LiveCopilotSession:
         self._last_barge_in_time = 0.0
         self._mic_stream = None
         self._speaker_stream = None
+        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._audio_in_queue: Optional[asyncio.Queue] = None
+        self._audio_out_queue: Optional[asyncio.Queue] = None
+        self._worker_tasks: list[asyncio.Task] = []
         self.memory = LiveSessionMemory()
         self._session_transcript: list[dict[str, Any]] = []
         self.on_audio_level = None
@@ -246,17 +250,73 @@ class LiveCopilotSession:
             return True
 
     def stop(self) -> bool:
-        """Stops the active live co-pilot session gracefully and signals workers to release audio devices."""
+        """Stops the active live co-pilot session forcefully, purges queues, cancels tasks, and closes audio hardware streams."""
         with self._lock:
             was_running = self._is_running or (self._worker_thread is not None and self._worker_thread.is_alive())
             if not was_running and not self._session_transcript:
                 return False
 
-            logger.info("[LiveCopilot] Stopping Multimodal Live Session...")
+            logger.info("[LiveCopilot] Forcefully Stopping Multimodal Live Session & Purging Audio Streams...")
             self._is_running = False
             self._is_connected = False
             self._is_ai_speaking = False
             self._stop_event.set()
+
+            # 1. Force immediate purge of audio queues
+            if self._audio_out_queue:
+                while not self._audio_out_queue.empty():
+                    try:
+                        self._audio_out_queue.get_nowait()
+                        self._audio_out_queue.task_done()
+                    except Exception:
+                        break
+
+            if self._audio_in_queue:
+                while not self._audio_in_queue.empty():
+                    try:
+                        self._audio_in_queue.get_nowait()
+                        self._audio_in_queue.task_done()
+                    except Exception:
+                        break
+
+            # 2. Force close audio output & input streams directly to prevent blocked executors
+            if self._speaker_stream:
+                try:
+                    if hasattr(self._speaker_stream, "abort"):
+                        self._speaker_stream.abort()
+                    elif hasattr(self._speaker_stream, "stop"):
+                        self._speaker_stream.stop()
+                    if hasattr(self._speaker_stream, "close"):
+                        self._speaker_stream.close()
+                except Exception as ex:
+                    logger.debug(f"[Speaker Force Close Notice]: {ex}")
+                self._speaker_stream = None
+
+            if self._mic_stream:
+                try:
+                    if hasattr(self._mic_stream, "abort"):
+                        self._mic_stream.abort()
+                    elif hasattr(self._mic_stream, "stop"):
+                        self._mic_stream.stop()
+                    if hasattr(self._mic_stream, "close"):
+                        self._mic_stream.close()
+                except Exception as ex:
+                    logger.debug(f"[Mic Force Close Notice]: {ex}")
+                self._mic_stream = None
+
+            # 3. Cancel all running asyncio tasks and stop event loop
+            if self._async_loop and self._async_loop.is_running():
+                for task in list(self._worker_tasks):
+                    if not task.done():
+                        try:
+                            self._async_loop.call_soon_threadsafe(task.cancel)
+                        except Exception:
+                            pass
+                try:
+                    self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+                except Exception:
+                    pass
+
             try:
                 sound_feedback(440, 100) # Low pitch chime on stop
             except Exception:
@@ -268,10 +328,10 @@ class LiveCopilotSession:
         _safe_destroy_cv2_windows("Gemini Vision Stream")
 
         if thread_to_join and thread_to_join.is_alive() and threading.current_thread() != thread_to_join:
-            thread_to_join.join(timeout=0.1)
+            thread_to_join.join(timeout=1.0)
 
         self._flush_memory_snapshot()
-        logger.info("[LiveCopilot] Session stopped cleanly.")
+        logger.info("[LiveCopilot] Session stopped and all streams purged cleanly.")
         return True
 
     def toggle(self) -> bool:
@@ -356,6 +416,9 @@ class LiveCopilotSession:
         audio_in_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=300)
         audio_out_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1000)
         loop = asyncio.get_running_loop()
+        self._async_loop = loop
+        self._audio_in_queue = audio_in_queue
+        self._audio_out_queue = audio_out_queue
 
         def _clear_queues():
             """Empties in/out audio queues cleanly to prevent stale audio backlog on reconnection."""
@@ -793,6 +856,7 @@ class LiveCopilotSession:
                                     asyncio.create_task(audio_output_worker(speaker_stream, session_active_event)),
                                     asyncio.create_task(receive_worker(session, session_active_event))
                                 ]
+                                self._worker_tasks = worker_tasks
 
                                 # Non-destructive loop: WebSocket session stays alive until receive_worker finishes or user stops
                                 while session_active_event.is_set() and not self._stop_event.is_set() and self._is_running:
