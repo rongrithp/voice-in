@@ -887,9 +887,19 @@ class DashboardGUI:
 
                     if not is_app_recording:
                         try:
-                            # Sample small 50ms audio chunk
+                            # Sample small 50ms audio chunk non-blockingly
                             samples = int(16000 * 0.05)
-                            rec = sd.rec(samples, samplerate=16000, channels=1, dtype='int16', blocking=True)
+                            rec = sd.rec(samples, samplerate=16000, channels=1, dtype='int16', blocking=False)
+                            waited = 0.0
+                            while self._is_running and self._is_visible and waited < 0.06:
+                                time.sleep(0.01)
+                                waited += 0.01
+                            if not self._is_running or not self._is_visible:
+                                try:
+                                    sd.stop()
+                                except Exception:
+                                    pass
+                                break
                             rms = calculate_rms(rec.flatten())
                             self.update_audio_level(rms)
                         except Exception:
@@ -986,6 +996,8 @@ class DashboardGUI:
 
     def destroy(self):
         """Closes and releases the GUI window."""
+        self._is_running = False
+        self._is_visible = False
         if not self.root:
             return
 
@@ -997,8 +1009,6 @@ class DashboardGUI:
                     self.root.after_cancel(self._metrics_job)
                 self.root.destroy()
                 self.root = None
-                self._is_running = False
-                self._is_visible = False
             except Exception as e:
                 logger.debug(f"[DashboardGUI Destroy Notice] {e}")
 

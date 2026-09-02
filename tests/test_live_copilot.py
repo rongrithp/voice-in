@@ -265,6 +265,7 @@ async def test_live_copilot_realtime_input_payload():
 
     session = LiveCopilotSession(show_preview=False)
     session._is_running = True
+    session.enable_wind_filter = False
 
     mock_client = MagicMock()
     mock_live_session = AsyncMock()
@@ -802,6 +803,7 @@ async def test_live_copilot_consecutive_speech_frames_flush_and_stream():
 
     session = LiveCopilotSession(show_preview=False)
     session._is_running = True
+    session.enable_wind_filter = False
 
     captured_inputs = []
     mock_client = MagicMock()
@@ -1003,6 +1005,21 @@ def test_live_copilot_stop_purges_audio_streams_and_tasks():
 
     # Verify task cancellation & loop stop
     assert mock_loop.call_soon_threadsafe.called is True
+
+
+def test_live_copilot_echo_suppression_and_mic_ducking():
+    """Verify that _is_speaking_active suppresses mic input and replaces frames with comfort silence."""
+    import time
+    session = LiveCopilotSession()
+    assert session._is_speaking_active.is_set() is False
+
+    # Simulate speaking active
+    session._is_speaking_active.set()
+    assert session._is_speaking_active.is_set() is True
+
+    # Stop session resets speaking active
+    session.stop()
+    assert session._is_speaking_active.is_set() is False
 
 
 

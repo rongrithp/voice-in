@@ -222,7 +222,10 @@ def test_app_f13_to_f20_preemption(app):
     # 2. Press F20 while STT is streaming -> STT must be aborted and Live Co-pilot started
     with patch("src.app.LiveCopilotSession.start", return_value=True) as mock_live_start:
         app.on_f20_live_toggle()
-        time.sleep(0.05)
+        for _ in range(25):
+            if mock_live_start.called:
+                break
+            time.sleep(0.02)
         assert app.is_streaming is False
         mock_live_start.assert_called_once()
 
@@ -234,7 +237,10 @@ def test_app_f20_to_f13_preemption(app):
     # 1. Simulate active Live Co-pilot
     with patch("src.app.LiveCopilotSession.start", return_value=True):
         app.on_f20_live_toggle()
-        time.sleep(0.05)
+        for _ in range(25):
+            if app.live_copilot is not None:
+                break
+            time.sleep(0.02)
 
     with patch.object(type(app.live_copilot), "is_running", new_callable=PropertyMock, return_value=True), \
          patch.object(app.live_copilot, "stop", return_value=True) as mock_live_stop, \

@@ -21,6 +21,7 @@ from google.genai import types
 
 import config
 from src.live_memory import LiveSessionMemory
+from src.audio import WindHarmonicsFilter
 
 logger = logging.getLogger("LiveCopilot")
 
@@ -177,6 +178,8 @@ class LiveCopilotSession:
         self.model_name = model_name or getattr(config, "GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
         self.show_preview = getattr(config, "SHOW_VISION_PREVIEW", True) if show_preview is None else show_preview
         self.noise_threshold = getattr(config, "GEMINI_LIVE_RMS_THRESHOLD", 2500.0)
+        self.enable_wind_filter = getattr(config, "ENABLE_WIND_FILTER", True)
+        self.wind_cutoff_hz = float(getattr(config, "WIND_FILTER_CUTOFF_HZ", 80.0))
         
         self._is_running = False
         self._is_connected = False
@@ -188,6 +191,7 @@ class LiveCopilotSession:
         self._is_ai_speaking = False
         self._last_ai_speech_end_time = 0.0
         self._last_barge_in_time = 0.0
+        self._is_speaking_active = threading.Event()
         self._mic_stream = None
         self._speaker_stream = None
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -252,6 +256,7 @@ class LiveCopilotSession:
     def stop(self) -> bool:
         """Stops the active live co-pilot session forcefully, purges queues, cancels tasks, and closes audio hardware streams."""
         with self._lock:
+            self._is_speaking_active.clear()
             was_running = self._is_running or (self._worker_thread is not None and self._worker_thread.is_alive())
             if not was_running and not self._session_transcript:
                 return False
@@ -458,16 +463,25 @@ class LiveCopilotSession:
         hangover_counter = 0
         pre_speech_buffer: list[bytes] = []
 
+        # Real-time Wind Harmonics & Low-Frequency Rumble Elimination
+        enable_wind = getattr(self, "enable_wind_filter", getattr(config, "ENABLE_WIND_FILTER", True))
+        wind_cutoff = float(getattr(self, "wind_cutoff_hz", getattr(config, "WIND_FILTER_CUTOFF_HZ", 80.0)))
+        copilot_wind_filter = WindHarmonicsFilter(cutoff_hz=wind_cutoff, sample_rate=16000) if enable_wind else None
+
         def mic_callback(indata, frames, time_info, status):
             nonlocal active_speech_counter, hangover_counter, pre_speech_buffer
             if not self._stop_event.is_set() and self._is_running:
                 try:
                     raw_bytes = bytes(indata)
+                    if copilot_wind_filter is not None:
+                        raw_bytes = copilot_wind_filter.process_pcm_bytes(raw_bytes)
 
-                    # AEC / Mute Guard: While AI is speaking (or within 200ms room echo reverberation window),
-                    # completely disable microphone barge-in and stream comfort silence (0-PCM) to eliminate acoustic feedback.
+                    # Full Software Acoustic Echo Suppression / Mic Ducking:
+                    # While Gemini is actively speaking (or during 250ms room reverberation echo tail),
+                    # drop all microphone input and stream pure 0-PCM comfort silence to eliminate acoustic feedback loop.
                     now_ts = time.perf_counter()
-                    if self._is_ai_speaking or (now_ts - getattr(self, "_last_ai_speech_end_time", 0.0) < 0.20):
+                    is_speaker_active = self._is_speaking_active.is_set() or self._is_ai_speaking or (now_ts - getattr(self, "_last_ai_speech_end_time", 0.0) < 0.25)
+                    if is_speaker_active:
                         active_speech_counter = 0
                         pre_speech_buffer.clear()
                         silence_bytes = b"\x00" * len(raw_bytes)
@@ -544,9 +558,14 @@ class LiveCopilotSession:
         barge_in_event = asyncio.Event()
 
         def _set_ai_speaking(speaking: bool):
-            if self._is_ai_speaking and not speaking:
-                self._last_ai_speech_end_time = time.perf_counter()
-            self._is_ai_speaking = speaking
+            if speaking:
+                self._is_speaking_active.set()
+                self._is_ai_speaking = True
+            else:
+                if self._is_speaking_active.is_set() or self._is_ai_speaking:
+                    self._last_ai_speech_end_time = time.perf_counter()
+                self._is_speaking_active.clear()
+                self._is_ai_speaking = False
 
         def _flush_audio_out():
             _set_ai_speaking(False)
@@ -562,6 +581,11 @@ class LiveCopilotSession:
             while active_event.is_set() and not self._stop_event.is_set():
                 try:
                     chunk = await asyncio.wait_for(audio_in_queue.get(), timeout=0.1)
+                    now_ts = time.perf_counter()
+                    is_speaker_active = self._is_speaking_active.is_set() or self._is_ai_speaking or (now_ts - getattr(self, "_last_ai_speech_end_time", 0.0) < 0.25)
+                    if is_speaker_active:
+                        # Full mic ducking / acoustic echo cancellation: force zero-PCM comfort silence to prevent audio feedback
+                        chunk = b"\x00" * len(chunk)
                     blob = types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
                     if hasattr(session, "send_realtime_input"):
                         await session.send_realtime_input(audio=blob)

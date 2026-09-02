@@ -15,6 +15,8 @@ from src.router import TranscribeEngine
 from src.vad import WebRTCVADSegmenter
 from src.actuator import inject_to_cursor, inject_delta_text, copy_cursor_to_bottom, copy_selected_text, TextActuator, paste_text, StreamingTextInjector
 from src.audio import calculate_rms, is_silence, robust_audio_stream_capture, LiveAudioStreamProducer
+from src.audio_service import AudioService
+from src.single_instance import SingleInstanceGuard
 from src import audio_control
 from src.tts_engine import TTSEngine, split_text_chunks
 from src.audio_player import AudioPlayer, PlaybackState
@@ -116,6 +118,9 @@ class VoiceOperatingHubApp:
         self._mode_transition_lock = threading.RLock()  # Inter-lock guard for exclusive F13 vs F20 preemption
         self._stop_event = threading.Event()
         self._warmup_event = threading.Event()
+        self._stt_abort_event = threading.Event()
+        self.single_instance_guard = SingleInstanceGuard()
+        self.audio_service: Optional[AudioService] = None
         self.is_streaming = False       # Pipeline A (STT) active state
         self.is_running = True          # Daemon running flag
         self.session_audio_frames = []  # Rolling Audio Accumulator frames
@@ -463,6 +468,7 @@ class VoiceOperatingHubApp:
                     audio_control.mute()
 
                     # 3. Start STT stream immediately without waiting for warmup
+                    self._stt_abort_event.clear()
                     self.is_streaming = True
                     self._stt_start_time = time.time()
                     reset_dedup_memory()
@@ -499,6 +505,7 @@ class VoiceOperatingHubApp:
                     self.update_tray_state()
                 else:
                     # 1. Stop mic stream immediately
+                    self._stt_abort_event.set()
                     self.is_streaming = False
                     if hasattr(self, "hud_overlay") and self.hud_overlay:
                         self.hud_overlay.show_stt_finalizing()
@@ -546,6 +553,7 @@ class VoiceOperatingHubApp:
     def emergency_flush_stt(self):
         """Emergency flush all audio buffers, abort cursor typing, and restore master audio."""
         with self.lock:
+            self._stt_abort_event.set()
             self.is_streaming = False
             if self.active_live_session:
                 try:
@@ -564,7 +572,7 @@ class VoiceOperatingHubApp:
             self.update_tray_state()
 
     def audio_worker(self):
-        while self.is_streaming:
+        while self.is_streaming and not self._stt_abort_event.is_set():
             try:
                 segment = self.audio_queue.get(timeout=0.15)
             except queue.Empty:
@@ -613,12 +621,14 @@ class VoiceOperatingHubApp:
         rms_threshold = getattr(config, "RMS_THRESHOLD", 250.0)
         silence_cutoff_ms = int(getattr(config, "VAD_SILENCE_MS", 280)) # Ultra-low latency silence cutoff (250-300ms)
 
+        self._stt_abort_event.clear()
         try:
             for data_bytes in robust_audio_stream_capture(
-                is_active_callback=lambda: self.is_streaming,
+                is_active_callback=lambda: self.is_streaming and not self._stt_abort_event.is_set() and not self._stop_event.is_set(),
                 sample_rate=config.SAMPLE_RATE,
                 channels=config.CHANNELS,
-                frame_samples=int(config.SAMPLE_RATE * (config.FRAME_DURATION_MS / 1000.0))
+                frame_samples=int(config.SAMPLE_RATE * (config.FRAME_DURATION_MS / 1000.0)),
+                abort_event=self._stt_abort_event
             ):
                 if not self.is_streaming:
                     break
@@ -1122,9 +1132,20 @@ class VoiceOperatingHubApp:
         """Reloads configuration, resets pipelines, and clears audio state."""
         logger.info("[App] Reloading Voice Operating Hub configurations...")
         with self.lock:
+            self._stt_abort_event.set()
             if self.is_streaming:
                 self.is_streaming = False
             self.audio_player.stop()
+            if self._live_audio_producer:
+                try:
+                    self._live_audio_producer.stop()
+                except Exception:
+                    pass
+            if self.audio_service:
+                try:
+                    self.audio_service.cleanup()
+                except Exception:
+                    pass
             self.live_copilot.stop()
             audio_control.unmute()
             with self.audio_queue.mutex:
@@ -1204,6 +1225,7 @@ class VoiceOperatingHubApp:
                 self._pynput_listener = pynput_keyboard.Listener(
                     on_press=_on_pynput_press,
                     on_release=_on_pynput_release,
+                    daemon=True,
                 )
                 self._pynput_listener.start()
                 logger.info(f"[Fallback Listener] pynput active for {hotkey_stt.upper()}, {hotkey_tts_sel.upper()}, {hotkey_tts_down.upper()}, {hotkey_toggle.upper()}, {hotkey_mon1.upper()}, {hotkey_mon2.upper()}, {hotkey_mon3.upper()}, {hotkey_live.upper()}, {hotkey_win_tts.upper()}")
@@ -1237,6 +1259,11 @@ class VoiceOperatingHubApp:
     def run(self):
         """Starts the daemon, tray icon, and listens for global hotkeys with micro-benchmarks."""
         t_run_start = time.perf_counter()
+        if not self.single_instance_guard.acquire():
+            logger.error("[SingleInstance Error] Another instance is already running. Halting startup to prevent hardware audio conflict.")
+            print("[SingleInstance Error] Another instance of Voice Operating Hub is already active.", flush=True)
+            return
+
         hotkey_stt = getattr(config, "HOTKEY_STT", "f13").upper()
         hotkey_tts_sel = getattr(config, "HOTKEY_TTS_READ_SEL", "f14").upper()
         hotkey_tts_down = getattr(config, "HOTKEY_TTS_READ_DOWN", "f15").upper()
@@ -1306,11 +1333,22 @@ class VoiceOperatingHubApp:
 
         logger.info("[App] Stopping Voice Operating Hub Daemon...")
         self.is_running = False
+        self._stt_abort_event.set()
         self._stop_event.set()
         with self.lock:
             if self.is_streaming:
                 self.is_streaming = False
             self.audio_player.stop()
+            if self._live_audio_producer:
+                try:
+                    self._live_audio_producer.stop()
+                except Exception:
+                    pass
+            if self.audio_service:
+                try:
+                    self.audio_service.cleanup()
+                except Exception:
+                    pass
             if self.live_copilot:
                 try:
                     self.live_copilot.stop()
@@ -1327,6 +1365,7 @@ class VoiceOperatingHubApp:
         if hasattr(self, "dashboard_gui") and self.dashboard_gui:
             self.dashboard_gui.destroy()
         self.tray_manager.stop()
+        self.single_instance_guard.release()
         logger.info("[App] Daemon terminated cleanly.")
 
 

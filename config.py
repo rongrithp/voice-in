@@ -64,6 +64,8 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 MAX_QUEUE_SIZE = 10
 RMS_THRESHOLD = float(os.getenv("RMS_THRESHOLD", "250.0"))
+ENABLE_WIND_FILTER = os.getenv("ENABLE_WIND_FILTER", "True").lower() in ("true", "1", "yes")
+WIND_FILTER_CUTOFF_HZ = float(os.getenv("WIND_FILTER_CUTOFF_HZ", "80.0"))
 
 # Gemini Live Co-pilot Audio Noise Gate & VAD Calibration
 GEMINI_LIVE_RMS_THRESHOLD = float(os.getenv("GEMINI_LIVE_RMS_THRESHOLD", "2500.0"))  # Calibrated noise floor gate (500-8000 range, default 2500)
