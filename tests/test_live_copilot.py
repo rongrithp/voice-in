@@ -1022,5 +1022,68 @@ def test_live_copilot_echo_suppression_and_mic_ducking():
     assert session._is_speaking_active.is_set() is False
 
 
+# ─── Contract Tests: LIVE_COPILOT_CONFIG propagation ─────────────────────────
 
 
+def test_config_pacing_instruction_propagates_to_system_instruction():
+    """
+    Verify that mutating pacing_instruction in LIVE_COPILOT_CONFIG directly
+    affects the string produced by build_system_instruction().
+    """
+    from config import build_system_instruction
+
+    custom_cfg = {
+        "role": "Expert Logic Co-pilot",
+        "pacing_instruction": "UNIQUE_PACING_SENTINEL_XYZ",
+        "speech_invariants": "",
+    }
+    result = build_system_instruction(custom_cfg)
+    assert "UNIQUE_PACING_SENTINEL_XYZ" in result, (
+        "pacing_instruction must be embedded verbatim in the assembled system instruction"
+    )
+
+    # Mutating the value must change the output
+    custom_cfg["pacing_instruction"] = "ANOTHER_PACING_SENTINEL_ABC"
+    result2 = build_system_instruction(custom_cfg)
+    assert "ANOTHER_PACING_SENTINEL_ABC" in result2
+    assert "UNIQUE_PACING_SENTINEL_XYZ" not in result2
+
+
+def test_config_turn_silence_timeout_propagates():
+    """
+    Verify that LIVE_COPILOT_CONFIG['turn_silence_timeout_sec'] carries the
+    correct calibrated value (1.2 s) and is accessible as a plain float.
+    """
+    from config import LIVE_COPILOT_CONFIG
+
+    timeout = LIVE_COPILOT_CONFIG.get("turn_silence_timeout_sec")
+    assert timeout is not None, "turn_silence_timeout_sec must be present in LIVE_COPILOT_CONFIG"
+    assert isinstance(timeout, float), "turn_silence_timeout_sec must be a float"
+    assert timeout == 1.2, f"Expected 1.2, got {timeout}"
+
+
+def test_config_dsp_flags_propagate_into_session():
+    """
+    Verify that LiveCopilotSession binds noise_threshold and enable_wind_filter
+    directly from LIVE_COPILOT_CONFIG so no hardcoded fallback is needed.
+    """
+    from config import LIVE_COPILOT_CONFIG
+
+    session = LiveCopilotSession()
+
+    expected_threshold = float(LIVE_COPILOT_CONFIG["rms_speech_threshold"])
+    expected_wind = bool(LIVE_COPILOT_CONFIG["enable_wind_filter"])
+    expected_cutoff = float(LIVE_COPILOT_CONFIG["wind_filter_cutoff_hz"])
+
+    assert session.noise_threshold == expected_threshold, (
+        f"session.noise_threshold ({session.noise_threshold}) must equal "
+        f"LIVE_COPILOT_CONFIG['rms_speech_threshold'] ({expected_threshold})"
+    )
+    assert session.enable_wind_filter == expected_wind, (
+        f"session.enable_wind_filter ({session.enable_wind_filter}) must equal "
+        f"LIVE_COPILOT_CONFIG['enable_wind_filter'] ({expected_wind})"
+    )
+    assert session.wind_cutoff_hz == expected_cutoff, (
+        f"session.wind_cutoff_hz ({session.wind_cutoff_hz}) must equal "
+        f"LIVE_COPILOT_CONFIG['wind_filter_cutoff_hz'] ({expected_cutoff})"
+    )

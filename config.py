@@ -110,3 +110,73 @@ FEMALE_VOICES = {
     "th-TH-Neural2-C": "Google Neural2-C (สตูดิโอ)",
     "th-TH-Standard-A": "Google Standard-A (คลาสสิก)",
 }
+
+# ─── Live Co-pilot Unified Runtime Configuration ──────────────────────────────
+# Single source of truth for all acoustic pacing, persona, and DSP parameters.
+# Edit values here; they propagate automatically into LiveCopilotSession and the
+# assembled system_instruction — no hardcoded strings to hunt down elsewhere.
+LIVE_COPILOT_CONFIG: dict = {
+    # Acoustic & Pacing Controls
+    "voice_name": "Aoede",
+    "pacing_instruction": (
+        "Speak at a moderate, calm, and slightly slower pace. Do not rush words."
+    ),
+    "turn_silence_timeout_sec": 1.2,
+    "session_idle_timeout_sec": 60.0,
+
+    # Persona & Spoken Constraints
+    "role": "Expert Logic Co-pilot",
+    "max_spoken_sentences": 3,
+    "speech_invariants": (
+        "1. Direct conclusion first, followed by immediate actionable next step.\n"
+        "2. Keep spoken turns strictly within 1-3 sentences maximum.\n"
+        "3. Speak acoustically: never recite raw tables, code blocks, or raw JSON keys aloud.\n"
+        "4. Zero conversational fluff or introductory filler."
+    ),
+
+    # DSP & Mic Thresholds (mirrors ENABLE_WIND_FILTER / WIND_FILTER_CUTOFF_HZ /
+    # GEMINI_LIVE_RMS_THRESHOLD flat constants above for single-dict access)
+    "enable_wind_filter": True,
+    "wind_filter_cutoff_hz": 80.0,
+    "rms_speech_threshold": 2500,
+}
+
+
+def build_system_instruction(cfg: dict, rolling_context: str = "") -> str:
+    """
+    Assembles the full system_instruction string from LIVE_COPILOT_CONFIG (or any
+    compatible dict).  Injects the pacing directive into the preamble and appends
+    short-term session memory context when provided.
+
+    Args:
+        cfg: Configuration dict — typically LIVE_COPILOT_CONFIG.
+        rolling_context: Optional compressed summary of recent session turns.
+
+    Returns:
+        A fully-formed system instruction string ready for types.Content injection.
+    """
+    role = cfg.get("role", "Expert Logic Co-pilot")
+    pacing = cfg.get("pacing_instruction", "")
+    invariants = cfg.get("speech_invariants", "")
+
+    text = (
+        f"You are a {role} — an expert real-time AI co-pilot assisting the user "
+        "with their active screen and workflow. "
+        "You can see their screen and hear their voice simultaneously in real time. "
+        "Always respond naturally, fluently, and conversationally in Thai "
+        "(using standard English technical terms when appropriate). "
+        f"{pacing} "
+        "Proactively reference relevant context visible on their screen "
+        "(e.g. code, terminal outputs, error traces, web pages, or active windows) "
+        "to give immediate, actionable insight."
+    )
+    if invariants:
+        text += f"\n\nSpeech Constraints:\n{invariants}"
+    if rolling_context:
+        text += (
+            f"\n\nPrevious Context Summary:\n{rolling_context}\n"
+            "Use this context if the user refers to previous discussion, "
+            "otherwise focus on current screen."
+        )
+    return text
+

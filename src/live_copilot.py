@@ -20,6 +20,7 @@ from google import genai
 from google.genai import types
 
 import config
+from config import LIVE_COPILOT_CONFIG, build_system_instruction
 from src.live_memory import LiveSessionMemory
 from src.audio import WindHarmonicsFilter
 
@@ -177,9 +178,11 @@ class LiveCopilotSession:
         self.fps = fps or getattr(config, "GEMINI_LIVE_FPS", 0.67)
         self.model_name = model_name or getattr(config, "GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
         self.show_preview = getattr(config, "SHOW_VISION_PREVIEW", True) if show_preview is None else show_preview
-        self.noise_threshold = getattr(config, "GEMINI_LIVE_RMS_THRESHOLD", 2500.0)
-        self.enable_wind_filter = getattr(config, "ENABLE_WIND_FILTER", True)
-        self.wind_cutoff_hz = float(getattr(config, "WIND_FILTER_CUTOFF_HZ", 80.0))
+        # DSP & noise gate — sourced from LIVE_COPILOT_CONFIG for single-dict access;
+        # flat config constants kept for backward-compat but LIVE_COPILOT_CONFIG takes precedence.
+        self.noise_threshold = float(LIVE_COPILOT_CONFIG.get("rms_speech_threshold", getattr(config, "GEMINI_LIVE_RMS_THRESHOLD", 2500.0)))
+        self.enable_wind_filter = bool(LIVE_COPILOT_CONFIG.get("enable_wind_filter", getattr(config, "ENABLE_WIND_FILTER", True)))
+        self.wind_cutoff_hz = float(LIVE_COPILOT_CONFIG.get("wind_filter_cutoff_hz", getattr(config, "WIND_FILTER_CUTOFF_HZ", 80.0)))
         
         self._is_running = False
         self._is_connected = False
@@ -388,26 +391,20 @@ class LiveCopilotSession:
         candidates = [m for m in candidate_models if m and not (m in seen or seen.add(m))]
 
         rolling_context = self.memory.get_rolling_context(max_sessions=2)
-        system_instruction_text = (
-            "You are an expert real-time AI co-pilot assisting the user with their active screen and workflow. "
-            "You can see their screen and hear their voice simultaneously in real time. "
-            "Always respond naturally, fluently, and conversationally in Thai (using standard English technical terms when appropriate). "
-            "Deliver well-structured spoken answers with genuine context and conversational depth—typically in 2 to 4 clear, informative sentences. "
-            "Never give one-word or overly robotic responses, but do not waffle or include filler phrases. "
-            "Proactively reference relevant context visible on their screen (e.g. code, terminal outputs, error traces, web pages, or active windows) to give immediate, actionable insight."
-        )
+        # Assemble system instruction dynamically from LIVE_COPILOT_CONFIG —
+        # pacing, persona, speech invariants, and optional session memory are
+        # all injected here without touching hardcoded strings.
+        system_instruction_text = build_system_instruction(LIVE_COPILOT_CONFIG, rolling_context)
         if rolling_context:
-            system_instruction_text += (
-                f"\n\nPrevious Context Summary:\n{rolling_context}\n"
-                "Use this context if the user refers to previous discussion, otherwise focus on current screen."
-            )
             logger.info("[LiveMemory] Injected short-term session memory into system instruction.")
 
         live_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=LIVE_COPILOT_CONFIG.get("voice_name", "Aoede")
+                    )
                 )
             ),
             thinking_config=types.ThinkingConfig(
