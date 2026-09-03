@@ -238,17 +238,83 @@ def test_app_f20_to_f13_preemption(app):
     with patch("src.app.LiveCopilotSession.start", return_value=True):
         app.on_f20_live_toggle()
         for _ in range(25):
-            if app.live_copilot is not None:
+            if app.live_session is not None:
                 break
             time.sleep(0.02)
 
-    with patch.object(type(app.live_copilot), "is_running", new_callable=PropertyMock, return_value=True), \
-         patch.object(app.live_copilot, "stop", return_value=True) as mock_live_stop, \
+    assert app.live_session is not None
+    with patch.object(type(app.live_session), "is_running", new_callable=PropertyMock, return_value=True), \
+         patch.object(app.live_session, "stop", return_value=True) as mock_live_stop, \
          patch("src.app.audio_control.mute"), \
          patch("threading.Thread"):
         # 2. Press F13 -> Live must be stopped and STT started
         app.toggle_stt()
         assert app.is_streaming is True
         mock_live_stop.assert_called_once()
+
+
+def test_app_f20_singleton_and_debounce(app):
+    """Test strict singleton management: rapid F20 presses drop duplicates and second toggle stops session."""
+    with patch("src.app.LiveCopilotSession.start", return_value=True) as mock_start, \
+         patch("src.app.LiveCopilotSession.stop", return_value=True) as mock_stop:
+
+        # 1. First F20 press launches session
+        app.on_f20_live_toggle()
+        for _ in range(25):
+            if app.live_session is not None:
+                break
+            time.sleep(0.02)
+
+        assert app.live_session is not None
+        first_session = app.live_session
+        assert mock_start.call_count == 1
+
+        # 2. Immediate second F20 press within debounce window is dropped (no duplicate spawn)
+        app.on_f20_live_toggle()
+        time.sleep(0.05)
+        assert app.live_session is first_session
+        assert mock_start.call_count == 1
+
+        # 3. Simulate session running and reset debounce timer for test
+        first_session._is_running = True
+        app._last_f20_press_time = 0.0
+
+        # 4. Third F20 press toggles OFF the session cleanly
+        app.on_f20_live_toggle()
+        for _ in range(25):
+            if app.live_session is None:
+                break
+            time.sleep(0.02)
+
+        assert app.live_session is None
+        mock_stop.assert_called()
+
+
+def test_app_f20_toast_notification_debounce(app):
+    """Test that desktop toast notifications are suppressed within 1.0s to avoid toast flooding."""
+    with patch.object(app.tray_manager, "notify") as mock_notify:
+        app._last_live_toast_time = 0.0
+        app._last_live_toast_status = ""
+
+        # 1. First toast should send
+        app.notify_live_copilot_toast("ACTIVE (🟢 ON)")
+        mock_notify.assert_called_once_with("Gemini Live Co-pilot", "Live Session: ACTIVE (🟢 ON)")
+
+        # 2. Immediate second toast within 1.0s should be debounced and suppressed
+        app.notify_live_copilot_toast("STOPPED (OFF)")
+        assert mock_notify.call_count == 1
+
+        # 3. Simulate elapsed time >= 1.0s
+        app._last_live_toast_time = time.perf_counter() - 1.1
+
+        # 4. Now the toast should be delivered
+        app.notify_live_copilot_toast("STOPPED (OFF)")
+        assert mock_notify.call_count == 2
+        assert "STOPPED" in mock_notify.call_args[0][1]
+
+        # 5. Redundant same-status toast even after 1.1s is suppressed
+        app._last_live_toast_time = time.perf_counter() - 1.1
+        app.notify_live_copilot_toast("STOPPED (OFF)")
+        assert mock_notify.call_count == 2
 
 

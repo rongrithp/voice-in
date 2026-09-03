@@ -28,6 +28,7 @@ from src.gui_dashboard import DashboardGUI
 from src.windows_local_tts import WindowsNativeTTSEngine
 from src.hud_overlay import HUDOverlay, HUDState
 from src.screen_border_overlay import ScreenBorderOverlay
+from src.robot_hud_widget import RobotHUDWidget, RobotLEDState
 
 logger = logging.getLogger("VoiceOperatingHub")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -142,7 +143,13 @@ class VoiceOperatingHubApp:
         self._live_audio_producer: Optional[LiveAudioStreamProducer] = None
 
         self.usage_tracker = UsageTracker()
-        self.live_copilot = LiveCopilotSession()
+        self.live_session: Optional[LiveCopilotSession] = None
+        self._fallback_live_copilot: Optional[LiveCopilotSession] = None
+        self._live_toggle_lock = threading.Lock()
+        self._is_live_transitioning = False
+        self._last_f20_press_time = 0.0
+        self._last_live_toast_time = 0.0
+        self._last_live_toast_status = ""
         self._stt_start_time = 0.0
 
         # Log detected monitors with resolutions at startup
@@ -166,21 +173,20 @@ class VoiceOperatingHubApp:
             on_emergency_unmute=self.emergency_unmute,
             on_reset_usage=self.on_reset_usage,
             on_exit=self.stop,
-            is_live_active_cb=lambda: bool(self.live_copilot and self.live_copilot.is_running),
+            is_live_active_cb=lambda: bool(self.live_session and self.live_session.is_running),
             usage_tracker_ref=self.usage_tracker
         )
         # On-Screen Floating Pill HUD & Neon Screen Border Overlays
         self.hud_overlay = hud_overlay if hud_overlay is not None else HUDOverlay(position="top-center")
         self.screen_border = ScreenBorderOverlay()
-        if self.live_copilot:
-            self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
-            self.live_copilot.on_connected = lambda: self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None
+        self.robot_widget = RobotHUDWidget()
 
         if start_gui:
             self.dashboard_gui.start_in_thread()
             if hud_overlay is None:
                 self.hud_overlay.start()
                 self.hud_overlay.show_system_booting()
+            self.robot_widget.start()
             self.screen_border.start()
 
         # System Tray Manager (Lightweight init)
@@ -195,7 +201,7 @@ class VoiceOperatingHubApp:
             on_live_toggle=self.on_f20_live_toggle,
             on_windows_local_tts=self.on_f21_windows_local_tts,
             on_exit=self.stop,
-            is_live_active_callback=lambda: bool(self.live_copilot and self.live_copilot.is_running),
+            is_live_active_callback=lambda: bool(self.live_session and self.live_session.is_running),
             app_title="Voice Operating Hub",
             current_speed=initial_tts_speed,
             current_voice=initial_tts_voice,
@@ -248,6 +254,21 @@ class VoiceOperatingHubApp:
             self._audio_player = AudioPlayer(lazy_init=True)
             self._audio_player.set_on_finished_callback(self._on_tts_playback_finished)
         return self._audio_player
+
+    @property
+    def live_copilot(self) -> Optional[LiveCopilotSession]:
+        """Provides backwards-compatible access to the live session singleton or idle fallback."""
+        if self.live_session is not None:
+            return self.live_session
+        if getattr(self, "_fallback_live_copilot", None) is None:
+            cur_mon = getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
+            self._fallback_live_copilot = LiveCopilotSession(target_monitor=cur_mon)
+        return self._fallback_live_copilot
+
+    @live_copilot.setter
+    def live_copilot(self, val: Optional[LiveCopilotSession]):
+        self.live_session = val
+        self._fallback_live_copilot = val
 
     @audio_player.setter
     def audio_player(self, val: AudioPlayer):
@@ -351,8 +372,8 @@ class VoiceOperatingHubApp:
                 self.hud_overlay.show_stt()
             if hasattr(self, "dashboard_gui") and self.dashboard_gui:
                 self.dashboard_gui.update_status("🔴 STT Active (Ingesting Audio)", is_active=True)
-        elif hasattr(self, "live_copilot") and self.live_copilot and self.live_copilot.is_running:
-            tooltip = "[🔴 LIVE STREAMING ACTIVE - INGESTING AUDIO (F20 Live Co-pilot)]"
+        elif hasattr(self, "live_session") and self.live_session and self.live_session.is_running:
+            tooltip = "[🎙️ LIVE STREAMING ACTIVE - INGESTING AUDIO (F20 Live Co-pilot)]"
             self.tray_manager.update_status(DaemonStatus.ACTIVE, tooltip)
             if hasattr(self, "hud_overlay") and self.hud_overlay:
                 self.hud_overlay.show_live()
@@ -441,22 +462,28 @@ class VoiceOperatingHubApp:
 
     def hard_abort_live_copilot(self):
         """Preemptively stops active Gemini Live Co-pilot and releases microphone hardware in < 50ms."""
-        if self.live_copilot:
-            try:
-                self.live_copilot.stop()
-            except Exception as ex:
-                logger.debug(f"[Hard Abort Live Error]: {ex}")
-            self.live_copilot = None
-        if hasattr(self, "screen_border") and self.screen_border:
-            self.screen_border.hide()
-        logger.info("[App] ⚡ Preempted & stopped active Gemini Live session.")
+        with self._live_toggle_lock:
+            if self.live_session:
+                try:
+                    self.live_session.stop()
+                except Exception as ex:
+                    logger.debug(f"[Hard Abort Live Error]: {ex}")
+                self.live_session = None
+                self._fallback_live_copilot = None
+            if hasattr(self, "screen_border") and self.screen_border:
+                self.screen_border.hide()
+            if hasattr(self, "robot_widget") and self.robot_widget:
+                self.robot_widget.set_state(RobotLEDState.OFF)
+            if hasattr(self, "hud_overlay") and self.hud_overlay:
+                self.hud_overlay.hide()
+            logger.info("[App] ⚡ Preempted & stopped active Gemini Live session.")
 
     def toggle_stt(self):
         with self._mode_transition_lock:
             with self._toggle_lock:
                 if not self.is_streaming:
                     # 0. Preemptively stop Gemini Live Co-pilot if active to guarantee exclusive audio ownership
-                    if hasattr(self, "live_copilot") and self.live_copilot and self.live_copilot.is_running:
+                    if hasattr(self, "live_session") and self.live_session and self.live_session.is_running:
                         logger.info("[Preemption] F13 pressed while F20 Live is active -> Preempting Live Co-pilot...")
                         self.hard_abort_live_copilot()
                         time.sleep(0.02)
@@ -992,8 +1019,13 @@ class VoiceOperatingHubApp:
         """Dynamic runtime update: Gemini Live Co-pilot Barge-in RMS sensitivity threshold."""
         logger.info(f"[App Dynamic Config] Live Barge-in RMS threshold set to {threshold:.1f}")
         config.GEMINI_LIVE_RMS_THRESHOLD = float(threshold)
+        config.GEMINI_LIVE_BARGE_IN_THRESHOLD = float(threshold)
+        if hasattr(self, "live_session") and self.live_session:
+            self.live_session.noise_threshold = float(threshold)
+            self.live_session.barge_in_threshold = float(threshold)
         if hasattr(self, "live_copilot") and self.live_copilot:
             self.live_copilot.noise_threshold = float(threshold)
+            self.live_copilot.barge_in_threshold = float(threshold)
 
     def on_vad_silence_change(self, silence_ms: int):
         """Dynamic runtime update: VAD silence cutoff duration window."""
@@ -1054,69 +1086,121 @@ class VoiceOperatingHubApp:
     # -------------------------------------------------------------------------
 
     def on_f20_live_toggle(self):
-        """Toggle Gemini Multimodal Live Co-pilot streaming session (F20) asynchronously."""
-        # Low-Latency Immediate Visual Trigger: show connecting state in 0ms on the caller thread
-        is_currently_running = bool(self.live_copilot and self.live_copilot.is_running)
-        if not is_currently_running:
-            if hasattr(self, "hud_overlay") and self.hud_overlay:
-                self.hud_overlay.show_live_connecting()
+        """Toggle Gemini Multimodal Live Co-pilot streaming session (F20) asynchronously with strict singleton enforcement."""
+        now = time.perf_counter()
+
+        # 1. Debounce guard: drop rapid-fire key repeat / jitter within debounce window
+        with self._live_toggle_lock:
+            if now - self._last_f20_press_time < 0.3:
+                logger.debug("[Live Co-pilot] F20 press ignored (debounce window active).")
+                return
+            if self._is_live_transitioning:
+                logger.debug("[Live Co-pilot] F20 press ignored (session transition in progress).")
+                return
+            self._last_f20_press_time = now
+            self._is_live_transitioning = True
 
         def _toggle_worker():
-            with self._mode_transition_lock:
-                try:
+            try:
+                with self._mode_transition_lock:
                     # If STT recording is currently active, preemptively abort it immediately to free audio hardware
                     if self.is_streaming:
                         logger.info("[Preemption] F20 pressed while STT is active -> Preempting STT dictation...")
                         self.hard_abort_stt()
                         time.sleep(0.02)
 
-                    if not is_currently_running:
-                        # 0. Ensure any orphan session is 100% stopped and purged before allocating a new one
-                        if hasattr(self, "live_copilot") and self.live_copilot is not None:
-                            try:
-                                self.live_copilot.stop()
-                            except Exception:
-                                pass
-                            self.live_copilot = None
-
-                        # 1. Fresh Session Re-instantiation: guarantees clean state & hydrates Short-term Memory
-                        cur_mon = getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
-                        self.live_copilot = LiveCopilotSession(target_monitor=cur_mon)
-                        self.live_copilot.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
-                        self.live_copilot.on_handshake = lambda: self.hud_overlay.show_live_handshake() if hasattr(self, "hud_overlay") and self.hud_overlay else None
-                        self.live_copilot.on_connected = lambda: (
-                            self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None,
-                            self.screen_border.show() if hasattr(self, "screen_border") and self.screen_border else None
-                        )
-                        self.live_copilot.on_error = lambda: self.hud_overlay.show_live_error() if hasattr(self, "hud_overlay") and self.hud_overlay else None
-
-                        is_active = self.live_copilot.start()
-                    else:
-                        # 2. Instant Stop: Hide HUD and border immediately
+                    if self.live_session is not None and self.live_session.is_running:
+                        # Fully tear down active session
+                        logger.info("[Live Co-pilot] Stopping active Live session...")
                         if hasattr(self, "hud_overlay") and self.hud_overlay:
                             self.hud_overlay.hide()
                         if hasattr(self, "screen_border") and self.screen_border:
                             self.screen_border.hide()
+                        if hasattr(self, "robot_widget") and self.robot_widget:
+                            self.robot_widget.set_state(RobotLEDState.OFF)
 
-                        self.hard_abort_live_copilot()
-                        is_active = False
+                        session_to_stop = self.live_session
+                        self.live_session = None
+                        self._fallback_live_copilot = None
+                        try:
+                            session_to_stop.stop()
+                        except Exception as ex:
+                            logger.debug(f"[Live Co-pilot Stop Notice]: {ex}")
 
-                    status_str = "ACTIVE (🟢 ON)" if is_active else "STOPPED (OFF)"
+                        status_str = "STOPPED (OFF)"
+                    else:
+                        # Ensure any dead reference is cleaned up
+                        if self.live_session is not None:
+                            try:
+                                self.live_session.stop()
+                            except Exception:
+                                pass
+                            self.live_session = None
+                            self._fallback_live_copilot = None
+
+                        # Launch EXACTLY ONE instance of LiveCopilotSession
+                        logger.info("[Live Co-pilot] Launching new LiveCopilotSession singleton...")
+                        if hasattr(self, "hud_overlay") and self.hud_overlay:
+                            self.hud_overlay.show_live_connecting()
+
+                        cur_mon = getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
+                        session = LiveCopilotSession(target_monitor=cur_mon)
+                        self.live_session = session
+                        self._fallback_live_copilot = session
+
+                        session.on_traffic_state = lambda is_tx: self.robot_widget.set_traffic_state(is_tx) if hasattr(self, "robot_widget") and self.robot_widget else None
+                        session.on_audio_level = lambda rms: self.hud_overlay.update_audio_level(rms) if hasattr(self, "hud_overlay") and self.hud_overlay else None
+                        session.on_handshake = lambda: self.hud_overlay.show_live_handshake() if hasattr(self, "hud_overlay") and self.hud_overlay else None
+                        session.on_connected = lambda: (
+                            self.hud_overlay.show_live() if hasattr(self, "hud_overlay") and self.hud_overlay else None,
+                            self.screen_border.show() if hasattr(self, "screen_border") and self.screen_border else None,
+                            self.robot_widget.set_state(RobotLEDState.IDLE) if hasattr(self, "robot_widget") and self.robot_widget else None
+                        )
+                        session.on_error = lambda: (
+                            self.hud_overlay.show_live_error() if hasattr(self, "hud_overlay") and self.hud_overlay else None,
+                            self.robot_widget.set_state(RobotLEDState.OFF) if hasattr(self, "robot_widget") and self.robot_widget else None
+                        )
+
+                        is_started = session.start()
+                        status_str = "ACTIVE (🟢 ON)" if is_started else "FAILED TO START"
+
                     logger.info(f"[Live Co-pilot] Session status toggled -> {status_str}")
-                    self.tray_manager.notify("Gemini Live Co-pilot", f"Live Session: {status_str}")
-                except Exception as ex:
-                    logger.error(f"[Live Co-pilot Error] Failed to toggle live session: {ex}")
-                    if hasattr(self, "hud_overlay") and self.hud_overlay:
-                        self.hud_overlay.show_live_error()
-                finally:
-                    if not (self.live_copilot and self.live_copilot.is_running) and not self.is_streaming:
-                        if hasattr(self, "hud_overlay") and self.hud_overlay and self.hud_overlay.state != HUDState.LIVE_ERROR:
-                            self.hud_overlay.hide()
-                        if hasattr(self, "screen_border") and self.screen_border:
-                            self.screen_border.hide()
-                    self.update_tray_state()
+                    self.notify_live_copilot_toast(status_str)
+            except Exception as ex:
+                logger.error(f"[Live Co-pilot Error] Failed to toggle live session: {ex}")
+                if hasattr(self, "hud_overlay") and self.hud_overlay:
+                    self.hud_overlay.show_live_error()
+            finally:
+                with self._live_toggle_lock:
+                    self._is_live_transitioning = False
+                if not (self.live_session and self.live_session.is_running) and not self.is_streaming:
+                    if hasattr(self, "hud_overlay") and self.hud_overlay and self.hud_overlay.state != HUDState.LIVE_ERROR:
+                        self.hud_overlay.hide()
+                    if hasattr(self, "screen_border") and self.screen_border:
+                        self.screen_border.hide()
+                self.update_tray_state()
 
         threading.Thread(target=_toggle_worker, daemon=True, name="LiveToggleWorker").start()
+
+    def notify_live_copilot_toast(self, status_str: str):
+        """Sends debounced desktop tray toast notification for Live Co-pilot status changes."""
+        now = time.perf_counter()
+        with self._live_toggle_lock:
+            # Skip toast display if status changed within the last 1.0s or redundant
+            if self._last_live_toast_time > 0 and (now - self._last_live_toast_time < 1.0):
+                logger.debug(f"[Live Co-pilot Toast] Debounced toast within 1.0s (status={status_str})")
+                return
+            if status_str == getattr(self, "_last_live_toast_status", None):
+                logger.debug(f"[Live Co-pilot Toast] Suppressed redundant toast (status={status_str})")
+                return
+            self._last_live_toast_time = now
+            self._last_live_toast_status = status_str
+
+        if hasattr(self, "tray_manager") and self.tray_manager:
+            try:
+                self.tray_manager.notify("Gemini Live Co-pilot", f"Live Session: {status_str}")
+            except Exception as ex:
+                logger.debug(f"[Live Co-pilot Toast Error]: {ex}")
 
     # -------------------------------------------------------------------------
     # Daemon Lifecycle & Management
@@ -1349,12 +1433,13 @@ class VoiceOperatingHubApp:
                     self.audio_service.cleanup()
                 except Exception:
                     pass
-            if self.live_copilot:
+            if hasattr(self, "live_session") and self.live_session:
                 try:
-                    self.live_copilot.stop()
+                    self.live_session.stop()
                 except Exception:
                     pass
-                self.live_copilot = None
+                self.live_session = None
+                self._fallback_live_copilot = None
             audio_control.unmute()
 
         self._unregister_hotkeys()
@@ -1362,6 +1447,8 @@ class VoiceOperatingHubApp:
             self.hud_overlay.stop()
         if hasattr(self, "screen_border") and self.screen_border:
             self.screen_border.stop()
+        if hasattr(self, "robot_widget") and self.robot_widget:
+            self.robot_widget.stop()
         if hasattr(self, "dashboard_gui") and self.dashboard_gui:
             self.dashboard_gui.destroy()
         self.tray_manager.stop()

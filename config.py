@@ -3,17 +3,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _sanitize(value: str | None) -> str | None:
+    """Strip surrounding whitespace and accidental quote-wrapping from env values.
+
+    Ensures robustness against malformed .env entries such as KEY="value" or
+    KEY='value', which python-dotenv may or may not strip depending on version.
+    """
+    if value is None:
+        return value
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1]
+    return value
+
 # Hotkey Bindings (F13–F20 Dedicated Layout)
-HOTKEY_STT = os.getenv("HOTKEY_STT", "f13").lower()             # Speak to cursor (F13)
-HOTKEY_TTS_READ_SEL = os.getenv("HOTKEY_TTS_READ_SEL", "f14").lower()    # Read already selected text only (F14)
-HOTKEY_TTS_READ_DOWN = os.getenv("HOTKEY_TTS_READ_DOWN", "f15").lower()   # Select from cursor to bottom and read (F15)
-HOTKEY_TTS_TOGGLE = os.getenv("HOTKEY_TTS_TOGGLE", "f16").lower()      # Toggle Play / Pause (F16)
-HOTKEY_CAP_MON1 = os.getenv("HOTKEY_CAP_MON1", "f17").lower()        # Capture Monitor 1 to Clipboard (F17)
-HOTKEY_CAP_MON2 = os.getenv("HOTKEY_CAP_MON2", "f18").lower()        # Capture Monitor 2 to Clipboard (F18)
-HOTKEY_CAP_MON3 = os.getenv("HOTKEY_CAP_MON3", "f19").lower()        # Capture Monitor 3 to Clipboard (F19)
-HOTKEY_LIVE_COPILOT = os.getenv("HOTKEY_LIVE_COPILOT", "f20").lower() # Toggle Gemini Multimodal Live Co-pilot (F20)
+HOTKEY_STT = _sanitize(os.getenv("HOTKEY_STT", "f13")).lower()             # Speak to cursor (F13)
+HOTKEY_TTS_READ_SEL = _sanitize(os.getenv("HOTKEY_TTS_READ_SEL", "f14")).lower()    # Read already selected text only (F14)
+HOTKEY_TTS_READ_DOWN = _sanitize(os.getenv("HOTKEY_TTS_READ_DOWN", "f15")).lower()   # Select from cursor to bottom and read (F15)
+HOTKEY_TTS_TOGGLE = _sanitize(os.getenv("HOTKEY_TTS_TOGGLE", "f16")).lower()      # Toggle Play / Pause (F16)
+HOTKEY_CAP_MON1 = _sanitize(os.getenv("HOTKEY_CAP_MON1", "f17")).lower()        # Capture Monitor 1 to Clipboard (F17)
+HOTKEY_CAP_MON2 = _sanitize(os.getenv("HOTKEY_CAP_MON2", "f18")).lower()        # Capture Monitor 2 to Clipboard (F18)
+HOTKEY_CAP_MON3 = _sanitize(os.getenv("HOTKEY_CAP_MON3", "f19")).lower()        # Capture Monitor 3 to Clipboard (F19)
+HOTKEY_LIVE_COPILOT = _sanitize(os.getenv("HOTKEY_LIVE_COPILOT", "f20")).lower() # Toggle Gemini Multimodal Live Co-pilot (F20)
 KEY_LIVE_COPILOT_TOGGLE = "F20"
-HOTKEY_WINDOWS_LOCAL_TTS = os.getenv("HOTKEY_WINDOWS_LOCAL_TTS", "f21").lower() # Windows Local Native TTS Offline (F21)
+HOTKEY_WINDOWS_LOCAL_TTS = _sanitize(os.getenv("HOTKEY_WINDOWS_LOCAL_TTS", "f21")).lower() # Windows Local Native TTS Offline (F21)
 KEY_WINDOWS_LOCAL_TTS = "F21"
 
 DEFAULT_TARGET_MONITOR = int(os.getenv("DEFAULT_TARGET_MONITOR", "1"))
@@ -21,8 +35,12 @@ GEMINI_LIVE_TARGET_MONITOR = int(os.getenv("GEMINI_LIVE_TARGET_MONITOR", "1"))  
 GEMINI_LIVE_FPS = float(os.getenv("GEMINI_LIVE_FPS", "0.67")) # 1 frame per 1.5s (~0.67 FPS)
 GEMINI_LIVE_FRAME_INTERVAL = float(os.getenv("GEMINI_LIVE_FRAME_INTERVAL", "1.5")) # 1.5s
 GEMINI_LIVE_JPEG_QUALITY = int(os.getenv("GEMINI_LIVE_JPEG_QUALITY", "50")) # Quality 50
-GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
-SHOW_VISION_PREVIEW = os.getenv("SHOW_VISION_PREVIEW", "True").lower() in ("true", "1", "yes")
+GEMINI_LIVE_MODEL = _sanitize(os.getenv("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview"))
+SHOW_VISION_PREVIEW = _sanitize(os.getenv("SHOW_VISION_PREVIEW", "True")).lower() in ("true", "1", "yes")
+
+# Fovea Vision Pipeline
+FOVEA_CAPTURE_HZ = int(os.getenv("FOVEA_CAPTURE_HZ", "15"))          # Cursor-centric capture rate (15–20 Hz)
+FOVEA_MOVE_THRESHOLD = int(os.getenv("FOVEA_MOVE_THRESHOLD", "20"))  # Min pixel displacement to recompute crop bbox
 
 # Backward compatible aliases
 HOTKEY = HOTKEY_STT
@@ -50,12 +68,12 @@ def get_google_credentials_path() -> str:
     return os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
 
 # Primary STT Engine Configuration (Google Cloud Speech gRPC / Gemini / Local)
-STT_ENGINE = os.getenv("STT_ENGINE", "gcp")  # Options: 'gcp' (Google Cloud Streaming STT), 'gemini-2.5-flash', 'local'
+STT_ENGINE = _sanitize(os.getenv("STT_ENGINE", "gcp"))  # Options: 'gcp' (Google Cloud Streaming STT), 'gemini-2.5-flash', 'local'
 GOOGLE_APPLICATION_CREDENTIALS = get_google_credentials_path()
-LANGUAGE_CODE = os.getenv("LANGUAGE_CODE", "th-TH")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-STT_MODE = os.getenv("STT_MODE", "streaming")  # Options: 'streaming' (Real-Time Interim Tokens < 200ms), 'batch'
+LANGUAGE_CODE = _sanitize(os.getenv("LANGUAGE_CODE", "th-TH"))
+GEMINI_MODEL = _sanitize(os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+GEMINI_API_KEY = _sanitize(os.getenv("GEMINI_API_KEY", ""))
+STT_MODE = _sanitize(os.getenv("STT_MODE", "streaming"))  # Options: 'streaming' (Real-Time Interim Tokens < 200ms), 'batch'
 MAX_CONTINUOUS_SPEECH_MS = int(os.getenv("MAX_CONTINUOUS_SPEECH_MS", "1800"))  # 1.8s continuous speech slice window
 OVERLAP_MS = int(os.getenv("OVERLAP_MS", "300"))  # 300ms phonetic boundary overlap
 
@@ -69,6 +87,8 @@ WIND_FILTER_CUTOFF_HZ = float(os.getenv("WIND_FILTER_CUTOFF_HZ", "80.0"))
 
 # Gemini Live Co-pilot Audio Noise Gate & VAD Calibration
 GEMINI_LIVE_RMS_THRESHOLD = float(os.getenv("GEMINI_LIVE_RMS_THRESHOLD", "2500.0"))  # Calibrated noise floor gate (500-8000 range, default 2500)
+GEMINI_LIVE_BARGE_IN_THRESHOLD = float(os.getenv("GEMINI_LIVE_BARGE_IN_THRESHOLD", "3500.0"))  # Calibrated floor for user barge-in speech detection (default 3500.0)
+GEMINI_LIVE_BARGE_IN_FRAMES = int(os.getenv("GEMINI_LIVE_BARGE_IN_FRAMES", "2"))  # Consecutive frames (~128-192ms) required to trigger barge-in during AI playback
 GEMINI_LIVE_MIN_SPEECH_FRAMES = int(os.getenv("GEMINI_LIVE_MIN_SPEECH_FRAMES", "3"))  # 3 consecutive frames (~192ms) to confirm speech intent (150ms-200ms)
 
 
@@ -135,10 +155,20 @@ LIVE_COPILOT_CONFIG: dict = {
     ),
 
     # DSP & Mic Thresholds (mirrors ENABLE_WIND_FILTER / WIND_FILTER_CUTOFF_HZ /
-    # GEMINI_LIVE_RMS_THRESHOLD flat constants above for single-dict access)
+    # GEMINI_LIVE_RMS_THRESHOLD / GEMINI_LIVE_BARGE_IN_THRESHOLD flat constants above for single-dict access)
     "enable_wind_filter": True,
     "wind_filter_cutoff_hz": 80.0,
     "rms_speech_threshold": 2500,
+    "barge_in_threshold": 3500.0,
+    "barge_in_consecutive_frames": 2,
+
+    # Fovea Vision Spatial Awareness directive (injected into system_instruction)
+    "spatial_awareness": (
+        "Spatial Awareness: You are looking through a dynamic Fovea viewport centered on "
+        "the user's mouse cursor. The small red reticle/pointer visible in the image "
+        "marks the user's active visual focus (Fovea). Analyze and speak specifically about "
+        "what is at or immediately surrounding this reticle."
+    ),
 }
 
 
@@ -158,6 +188,7 @@ def build_system_instruction(cfg: dict, rolling_context: str = "") -> str:
     role = cfg.get("role", "Expert Logic Co-pilot")
     pacing = cfg.get("pacing_instruction", "")
     invariants = cfg.get("speech_invariants", "")
+    spatial = cfg.get("spatial_awareness", "")
 
     text = (
         f"You are a {role} — an expert real-time AI co-pilot assisting the user "
@@ -170,6 +201,8 @@ def build_system_instruction(cfg: dict, rolling_context: str = "") -> str:
         "(e.g. code, terminal outputs, error traces, web pages, or active windows) "
         "to give immediate, actionable insight."
     )
+    if spatial:
+        text += f"\n\n{spatial}"
     if invariants:
         text += f"\n\nSpeech Constraints:\n{invariants}"
     if rolling_context:

@@ -1,0 +1,43 @@
+{
+  "credentials_json_path": "config/gcp_service_account.json",
+  "model_name": "gemini-2.5-flash",
+  "provider_type": "gemini",
+  "openai_base_url": "http://localhost:8000/v1",
+  "openai_api_key": "EMPTY",
+  "noise_gate_rms_threshold": 0.015,
+  "client_playback_speed": 1.0,
+  "vad_silence_timeout_sec": 3.0,
+  "rms_silence_timeout_sec": 5.0,
+  "thumbnail_dismiss_timeout_sec": 4.0,
+  "turn_silence_timeout_sec": 10.0,
+  "session_idle_timeout_sec": 60.0,
+  "audio": {
+    "turn_silence_timeout_sec": 10.0,
+    "session_idle_timeout_sec": 60.0
+  },
+  "persona": {
+    "style": "EXPERT_THINKING_OUT_LOUD",
+    "custom_system_instruction": null
+  },
+  "cost_per_million_input_tokens_thb": 2.50,
+  "cost_per_million_output_tokens_thb": 10.00,
+  "talk_to_cursor_hotkey": "F13",
+  "read_selection_hotkey": "Ctrl+Shift+R",
+  "wake_word": {
+    "primary_word": "gemini",
+    "aliases": ["hey gemini", "ok gemini"],
+    "sensitivity": 0.5,
+    "model_path": null
+  },
+  "pc_station_hotkeys": {
+    "f13": "talk_to_cursor",
+    "f14": "read_selected_text",
+    "f15": "read_below_text",
+    "f16": "toggle_audio_playback",
+    "f17": "capture_display_1",
+    "f18": "capture_display_2",
+    "f19": "capture_display_3",
+    "f20": "stream_ultrawide_live",
+    "alt+space": "quick_drop"
+  }
+}

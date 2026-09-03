@@ -1,0 +1,4 @@
+PyQt6>=6.6.0
+pywin32>=306
+sounddevice>=0.4.6
+numpy>=1.24.0

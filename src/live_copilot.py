@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import io
 import json
 import logging
@@ -181,6 +182,7 @@ class LiveCopilotSession:
         # DSP & noise gate — sourced from LIVE_COPILOT_CONFIG for single-dict access;
         # flat config constants kept for backward-compat but LIVE_COPILOT_CONFIG takes precedence.
         self.noise_threshold = float(LIVE_COPILOT_CONFIG.get("rms_speech_threshold", getattr(config, "GEMINI_LIVE_RMS_THRESHOLD", 2500.0)))
+        self.barge_in_threshold = float(LIVE_COPILOT_CONFIG.get("barge_in_threshold", getattr(config, "GEMINI_LIVE_BARGE_IN_THRESHOLD", 3500.0)))
         self.enable_wind_filter = bool(LIVE_COPILOT_CONFIG.get("enable_wind_filter", getattr(config, "ENABLE_WIND_FILTER", True)))
         self.wind_cutoff_hz = float(LIVE_COPILOT_CONFIG.get("wind_filter_cutoff_hz", getattr(config, "WIND_FILTER_CUTOFF_HZ", 80.0)))
         
@@ -192,21 +194,30 @@ class LiveCopilotSession:
         self._client: Optional[genai.Client] = None
         self._backend_desc: Optional[str] = None
         self._is_ai_speaking = False
+        self._is_speaking_active = threading.Event()
+        self._is_speaking_active.clear()
+        self._last_playback_time = 0.0
         self._last_ai_speech_end_time = 0.0
         self._last_barge_in_time = 0.0
-        self._is_speaking_active = threading.Event()
         self._mic_stream = None
         self._speaker_stream = None
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._audio_in_queue: Optional[asyncio.Queue] = None
         self._audio_out_queue: Optional[asyncio.Queue] = None
         self._worker_tasks: list[asyncio.Task] = []
+        self._active_session = None
+        self._active_conn_ctx = None
+        self._mouse_listener = None
         self.memory = LiveSessionMemory()
         self._session_transcript: list[dict[str, Any]] = []
         self.on_audio_level = None
         self.on_handshake = None
         self.on_connected = None
         self.on_error = None
+        self.on_traffic_state = None
+        self._traffic_debounce_timer: Optional[threading.Timer] = None
+        self._is_transmitting: bool = False
+        self._override_consecutive_frames: int = 0
 
         # Instant reference to pre-warmed client if already ready
         if _GLOBAL_LIVE_CLIENT is not None:
@@ -224,9 +235,125 @@ class LiveCopilotSession:
                     logger.debug(f"[LiveMemory Notice] Could not save session snapshot: {e}")
                 self._session_transcript = []
 
+    def _handle_interruption(self, source: str = "user_speech"):
+        """Forces state machine self-healing and barge-in cutoff."""
+        with self._lock:
+            self._is_speaking_active.clear()
+            self._is_ai_speaking = False
+            self._override_consecutive_frames = 0
+        if self._audio_out_queue:
+            while not self._audio_out_queue.empty():
+                try:
+                    self._audio_out_queue.get_nowait()
+                    self._audio_out_queue.task_done()
+                except Exception:
+                    break
+        if getattr(self, "_trigger_barge_in_fn", None) and callable(self._trigger_barge_in_fn):
+            try:
+                self._trigger_barge_in_fn(source)
+            except Exception as e:
+                logger.debug(f"[LiveCopilot Manual Interruption Notice] {e}")
+
+    def _safe_put_audio_in(self, data: bytes):
+        """Threadsafe non-blocking audio enqueue with QueueFull overflow protection."""
+        if self._audio_in_queue is None:
+            return
+        try:
+            self._audio_in_queue.put_nowait(data)
+        except (asyncio.QueueFull, Exception):
+            try:
+                self._audio_in_queue.get_nowait()
+                self._audio_in_queue.task_done()
+            except Exception:
+                pass
+            try:
+                self._audio_in_queue.put_nowait(data)
+            except Exception:
+                pass
+
+    def _enqueue_audio_in(self, data: bytes):
+        """Enqueues incoming audio chunk safely either via loop or directly."""
+        if self._async_loop and self._async_loop.is_running():
+            self._async_loop.call_soon_threadsafe(self._safe_put_audio_in, data)
+        else:
+            self._safe_put_audio_in(data)
+
+    def mic_callback(self, indata, frames=1024, time_info=None, status=None):
+        """Processes an incoming raw audio block from the microphone."""
+        if not self._stop_event.is_set() and self._is_running:
+            try:
+                raw_bytes = bytes(indata)
+                wind_filter = getattr(self, "_wind_filter", None) if getattr(self, "enable_wind_filter", True) else None
+                if wind_filter is not None:
+                    raw_bytes = wind_filter.process_pcm_bytes(raw_bytes)
+
+                audio_data = np.frombuffer(raw_bytes, dtype=np.int16)
+                rms = float(np.sqrt(np.mean(audio_data.astype(np.float64)**2))) if len(audio_data) > 0 else 0.0
+
+                if hasattr(self, "on_audio_level") and self.on_audio_level:
+                    try:
+                        self.on_audio_level(rms)
+                    except Exception:
+                        pass
+
+                # Vocal Barge-in via High-Threshold Energy Gate:
+                # When AI is speaking (playback active):
+                #   If rms >= 4000.0 for 2 consecutive frames, pass raw mic PCM upstream to trigger server-side VAD barge-in.
+                #   Otherwise, suppress to zero-PCM silence to prevent speaker echo bleed.
+                # When AI is NOT speaking:
+                #   Always pass raw mic PCM directly.
+                if self._is_ai_speaking or self._is_speaking_active.is_set():
+                    if rms >= 4000.0:
+                        self._override_consecutive_frames += 1
+                        if self._override_consecutive_frames >= 2:
+                            self._enqueue_audio_in(raw_bytes)
+                        else:
+                            silence_bytes = b"\x00" * len(raw_bytes)
+                            self._enqueue_audio_in(silence_bytes)
+                    else:
+                        self._override_consecutive_frames = 0
+                        silence_bytes = b"\x00" * len(raw_bytes)
+                        self._enqueue_audio_in(silence_bytes)
+                else:
+                    self._override_consecutive_frames = 0
+                    self._enqueue_audio_in(raw_bytes)
+            except Exception:
+                pass
+
     def warmup(self):
         """Zero-delay no-op: background warmup removed to guarantee instant direct connection."""
         pass
+
+    def set_traffic_state(self, is_transmitting: bool):
+        """Notifies registered listeners of live network/audio/vision traffic state."""
+        self._is_transmitting = is_transmitting
+        if callable(self.on_traffic_state):
+            try:
+                self.on_traffic_state(is_transmitting)
+            except Exception as e:
+                logger.debug(f"[LiveCopilot Traffic Callback Error] {e}")
+
+    def notify_traffic(self, debounce_ms: float = 300.0):
+        """
+        Fires set_traffic_state(True) on active data transfer and schedules
+        automatic reset back to False after debounce_ms (default 300ms) inactivity timeout.
+        """
+        if not self._is_running:
+            return
+
+        if not self._is_transmitting:
+            self.set_traffic_state(True)
+
+        if self._traffic_debounce_timer is not None:
+            self._traffic_debounce_timer.cancel()
+
+        def _revert():
+            if self._is_running:
+                self.set_traffic_state(False)
+
+        self._traffic_debounce_timer = threading.Timer(debounce_ms / 1000.0, _revert)
+        self._traffic_debounce_timer.daemon = True
+        self._traffic_debounce_timer.start()
 
     @property
     def is_running(self) -> bool:
@@ -246,6 +373,10 @@ class LiveCopilotSession:
             logger.info("[LiveCopilot] Starting Multimodal Live Session (Instant Direct Dispatch)...")
             self._stop_event.clear()
             self._is_running = True
+            self._is_ai_speaking = False
+            self._is_speaking_active.clear()
+            self._last_playback_time = 0.0
+            self._last_ai_speech_end_time = 0.0
             sound_feedback(880, 100) # High pitch chime on start
 
             self._worker_thread = threading.Thread(
@@ -256,19 +387,63 @@ class LiveCopilotSession:
             self._worker_thread.start()
             return True
 
+    async def run(self):
+        """Runs the multimodal live session lifecycle directly in an asyncio event loop."""
+        with self._lock:
+            if self._is_running:
+                logger.info("[LiveCopilot] Session already active.")
+                return
+            self._stop_event.clear()
+            self._is_running = True
+            self._is_ai_speaking = False
+            self._is_speaking_active.clear()
+            self._last_playback_time = 0.0
+            self._last_ai_speech_end_time = 0.0
+            sound_feedback(880, 100)
+
+        try:
+            self._async_loop = asyncio.get_running_loop()
+            await self._async_live_loop()
+        except (asyncio.CancelledError, RuntimeError) as ex:
+            err_msg = str(ex).lower()
+            if "event loop stopped" in err_msg or isinstance(ex, asyncio.CancelledError):
+                logger.debug(f"[LiveCopilot] Loop terminated via cancellation: {ex}")
+            else:
+                raise
+        finally:
+            self._is_running = False
+            self._is_connected = False
+            self._async_loop = None
+            if self.show_preview:
+                _safe_destroy_cv2_windows("Gemini Vision Stream")
+            self._flush_memory_snapshot()
+
     def stop(self) -> bool:
         """Stops the active live co-pilot session forcefully, purges queues, cancels tasks, and closes audio hardware streams."""
         with self._lock:
             self._is_speaking_active.clear()
             was_running = self._is_running or (self._worker_thread is not None and self._worker_thread.is_alive())
-            if not was_running and not self._session_transcript:
+            has_resources = (
+                self._speaker_stream is not None
+                or self._mic_stream is not None
+                or bool(self._worker_tasks)
+                or self._active_session is not None
+                or bool(self._session_transcript)
+            )
+            if not was_running and not has_resources:
                 return False
 
             logger.info("[LiveCopilot] Forcefully Stopping Multimodal Live Session & Purging Audio Streams...")
             self._is_running = False
             self._is_connected = False
             self._is_ai_speaking = False
+            self._override_consecutive_frames = 0
             self._stop_event.set()
+
+            if self._traffic_debounce_timer is not None:
+                self._traffic_debounce_timer.cancel()
+                self._traffic_debounce_timer = None
+            self.set_traffic_state(False)
 
             # 1. Force immediate purge of audio queues
             if self._audio_out_queue:
@@ -287,32 +462,72 @@ class LiveCopilotSession:
                     except Exception:
                         break
 
-            # 2. Force close audio output & input streams directly to prevent blocked executors
+            # 2. Stop mouse listener thread if running
+            if getattr(self, "_mouse_listener", None) is not None:
+                try:
+                    self._mouse_listener.stop()
+                except Exception:
+                    pass
+                self._mouse_listener = None
+
+            # 3. Force close audio output & input streams directly to prevent blocked executors and PortAudio threads
             if self._speaker_stream:
                 try:
                     if hasattr(self._speaker_stream, "abort"):
                         self._speaker_stream.abort()
-                    elif hasattr(self._speaker_stream, "stop"):
+                except Exception as ex:
+                    logger.debug(f"[Speaker Abort Notice]: {ex}")
+                try:
+                    if hasattr(self._speaker_stream, "stop"):
                         self._speaker_stream.stop()
+                except Exception:
+                    pass
+                try:
                     if hasattr(self._speaker_stream, "close"):
                         self._speaker_stream.close()
-                except Exception as ex:
-                    logger.debug(f"[Speaker Force Close Notice]: {ex}")
+                except Exception:
+                    pass
                 self._speaker_stream = None
 
             if self._mic_stream:
                 try:
                     if hasattr(self._mic_stream, "abort"):
                         self._mic_stream.abort()
-                    elif hasattr(self._mic_stream, "stop"):
+                except Exception as ex:
+                    logger.debug(f"[Mic Abort Notice]: {ex}")
+                try:
+                    if hasattr(self._mic_stream, "stop"):
                         self._mic_stream.stop()
+                except Exception:
+                    pass
+                try:
                     if hasattr(self._mic_stream, "close"):
                         self._mic_stream.close()
-                except Exception as ex:
-                    logger.debug(f"[Mic Force Close Notice]: {ex}")
+                except Exception:
+                    pass
                 self._mic_stream = None
 
-            # 3. Cancel all running asyncio tasks and stop event loop
+            # 4. Explicitly close active WebSocket session immediately
+            active_session = getattr(self, "_active_session", None)
+            if active_session:
+                try:
+                    ws = getattr(active_session, "_ws", None)
+                    if ws:
+                        transport = getattr(ws, "transport", None)
+                        if transport and hasattr(transport, "close"):
+                            transport.close()
+                except Exception:
+                    pass
+                if hasattr(active_session, "close"):
+                    try:
+                        res = active_session.close()
+                        if inspect.isawaitable(res) and self._async_loop and self._async_loop.is_running():
+                            asyncio.run_coroutine_threadsafe(res, self._async_loop)
+                    except Exception:
+                        pass
+                self._active_session = None
+
+            # 5. Cancel all pending asyncio tasks in the event loop
             if self._async_loop and self._async_loop.is_running():
                 for task in list(self._worker_tasks):
                     if not task.done():
@@ -320,6 +535,15 @@ class LiveCopilotSession:
                             self._async_loop.call_soon_threadsafe(task.cancel)
                         except Exception:
                             pass
+                try:
+                    for task in list(asyncio.all_tasks(self._async_loop)):
+                        if not task.done():
+                            try:
+                                self._async_loop.call_soon_threadsafe(task.cancel)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 try:
                     self._async_loop.call_soon_threadsafe(self._async_loop.stop)
                 except Exception:
@@ -352,13 +576,38 @@ class LiveCopilotSession:
 
     def _run_thread(self):
         """Dedicated thread entry point running isolated asyncio event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._async_loop = loop
         try:
-            asyncio.run(self._async_live_loop())
+            loop.run_until_complete(self._async_live_loop())
+        except (asyncio.CancelledError, RuntimeError) as ex:
+            err_msg = str(ex).lower()
+            if "event loop stopped" in err_msg or isinstance(ex, asyncio.CancelledError):
+                logger.debug(f"[LiveCopilot] Loop terminated via cancellation: {ex}")
+            else:
+                logger.error(f"[LiveCopilot Worker Error] {ex}", exc_info=True)
         except Exception as e:
             logger.error(f"[LiveCopilot Worker Error] {e}", exc_info=True)
         finally:
             self._is_running = False
             self._is_connected = False
+            try:
+                # Cancel all pending tasks cleanly before closing the loop
+                pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                self._async_loop = None
+
             if self.show_preview:
                 _safe_destroy_cv2_windows("Gemini Vision Stream")
             self._flush_memory_snapshot()
@@ -437,104 +686,16 @@ class LiveCopilotSession:
                 except Exception:
                     break
 
-        def _safe_put_audio_in(data: bytes):
-            """Threadsafe non-blocking audio enqueue with QueueFull overflow protection."""
-            try:
-                audio_in_queue.put_nowait(data)
-            except (asyncio.QueueFull, Exception):
-                # Queue full (e.g. during WebSocket reconnecting) -> drop oldest chunk to stay real-time
-                try:
-                    audio_in_queue.get_nowait()
-                    audio_in_queue.task_done()
-                except Exception:
-                    pass
-                try:
-                    audio_in_queue.put_nowait(data)
-                except Exception:
-                    pass
-
-        noise_threshold = getattr(self, "noise_threshold", getattr(config, "GEMINI_LIVE_RMS_THRESHOLD", 2500.0))
-        min_speech_frames = max(2, int(getattr(config, "GEMINI_LIVE_MIN_SPEECH_FRAMES", 3)))  # ~192ms (3 * 64ms)
-        speech_hangover_frames = 6  # ~384ms hangover window (6 * 64ms)
-        active_speech_counter = 0
-        hangover_counter = 0
-        pre_speech_buffer: list[bytes] = []
+        _safe_put_audio_in = self._safe_put_audio_in
 
         # Real-time Wind Harmonics & Low-Frequency Rumble Elimination
         enable_wind = getattr(self, "enable_wind_filter", getattr(config, "ENABLE_WIND_FILTER", True))
         wind_cutoff = float(getattr(self, "wind_cutoff_hz", getattr(config, "WIND_FILTER_CUTOFF_HZ", 80.0)))
         copilot_wind_filter = WindHarmonicsFilter(cutoff_hz=wind_cutoff, sample_rate=16000) if enable_wind else None
+        self._wind_filter = copilot_wind_filter
 
         def mic_callback(indata, frames, time_info, status):
-            nonlocal active_speech_counter, hangover_counter, pre_speech_buffer
-            if not self._stop_event.is_set() and self._is_running:
-                try:
-                    raw_bytes = bytes(indata)
-                    if copilot_wind_filter is not None:
-                        raw_bytes = copilot_wind_filter.process_pcm_bytes(raw_bytes)
-
-                    # Full Software Acoustic Echo Suppression / Mic Ducking:
-                    # While Gemini is actively speaking (or during 250ms room reverberation echo tail),
-                    # drop all microphone input and stream pure 0-PCM comfort silence to eliminate acoustic feedback loop.
-                    now_ts = time.perf_counter()
-                    is_speaker_active = self._is_speaking_active.is_set() or self._is_ai_speaking or (now_ts - getattr(self, "_last_ai_speech_end_time", 0.0) < 0.25)
-                    if is_speaker_active:
-                        active_speech_counter = 0
-                        pre_speech_buffer.clear()
-                        silence_bytes = b"\x00" * len(raw_bytes)
-                        loop.call_soon_threadsafe(_safe_put_audio_in, silence_bytes)
-                        return
-
-                    int16_arr = np.frombuffer(raw_bytes, dtype=np.int16)
-                    rms = float(np.sqrt(np.mean(int16_arr.astype(np.float32)**2))) if len(int16_arr) > 0 else 0.0
-                    current_threshold = float(getattr(self, "noise_threshold", getattr(config, "GEMINI_LIVE_RMS_THRESHOLD", 2500.0)))
-
-                    if hasattr(self, "on_audio_level") and self.on_audio_level:
-                        try:
-                            self.on_audio_level(rms)
-                        except Exception:
-                            pass
-
-                    if rms >= current_threshold:
-                        active_speech_counter += 1
-                        if active_speech_counter < min_speech_frames:
-                            # Tentative speech onset: buffer chunk and send comfort silence to prevent false barge-in trigger
-                            pre_speech_buffer.append(raw_bytes)
-                            if len(pre_speech_buffer) > min_speech_frames:
-                                pre_speech_buffer.pop(0)
-                            silence_bytes = b"\x00" * len(raw_bytes)
-                            loop.call_soon_threadsafe(_safe_put_audio_in, silence_bytes)
-                        elif active_speech_counter == min_speech_frames:
-                            # Speech confirmed (sustained >= min_speech_frames e.g. 192ms)!
-                            # Flush all buffered pre-speech frames to avoid clipping the start of speech
-                            for pre_chunk in pre_speech_buffer:
-                                loop.call_soon_threadsafe(_safe_put_audio_in, pre_chunk)
-                            pre_speech_buffer.clear()
-                            loop.call_soon_threadsafe(_safe_put_audio_in, raw_bytes)
-                            hangover_counter = speech_hangover_frames
-                        else:
-                            # Sustained active speech
-                            loop.call_soon_threadsafe(_safe_put_audio_in, raw_bytes)
-                            hangover_counter = speech_hangover_frames
-                    else:
-                        if active_speech_counter < min_speech_frames:
-                            # Isolated noise spike / wind pop that didn't reach min_speech_frames -> discard buffer
-                            pre_speech_buffer.clear()
-                            active_speech_counter = 0
-                            silence_bytes = b"\x00" * len(raw_bytes)
-                            loop.call_soon_threadsafe(_safe_put_audio_in, silence_bytes)
-                        else:
-                            # User paused or finished speaking
-                            active_speech_counter = max(0, active_speech_counter - 1)
-                            if hangover_counter > 0:
-                                hangover_counter -= 1
-                                loop.call_soon_threadsafe(_safe_put_audio_in, raw_bytes)
-                            else:
-                                pre_speech_buffer.clear()
-                                silence_bytes = b"\x00" * len(raw_bytes)
-                                loop.call_soon_threadsafe(_safe_put_audio_in, silence_bytes)
-                except Exception:
-                    pass
+            self.mic_callback(indata, frames, time_info, status)
 
         mic_stream = sd.RawInputStream(
             samplerate=16000,
@@ -553,6 +714,65 @@ class LiveCopilotSession:
         self._speaker_stream = speaker_stream
 
         barge_in_event = asyncio.Event()
+        turn_interrupted = threading.Event()
+
+        def _trigger_barge_in(source: str = "user_speech"):
+            now = time.perf_counter()
+            is_active = self._is_ai_speaking or self._is_speaking_active.is_set() or not audio_out_queue.empty()
+            should_log = is_active and (now - self._last_barge_in_time > 0.20)
+            self._last_barge_in_time = now
+
+            # State Machine Self-Healing:
+            # Force clear queue, reset speaking events, and reset flags immediately
+            turn_interrupted.set()
+            barge_in_event.set()
+            _flush_audio_out()
+            _set_ai_speaking(False)
+            self._is_speaking_active.clear()
+            self._is_ai_speaking = False
+            self._override_consecutive_frames = 0
+
+            # Auto-clear turn_interrupted after 200ms recovery window so future model turns are never blocked
+            try:
+                loop.call_later(0.20, turn_interrupted.clear)
+            except Exception:
+                turn_interrupted.clear()
+
+            # Ensure speaker_stream is stopped cleanly and restarted so playback consumer loop does not terminate
+            if speaker_stream:
+                try:
+                    if hasattr(speaker_stream, "abort"):
+                        speaker_stream.abort()
+                    elif hasattr(speaker_stream, "stop"):
+                        speaker_stream.stop()
+                except Exception as ex:
+                    logger.debug(f"[Barge-in Stream Stop Notice] {ex}")
+                try:
+                    if hasattr(speaker_stream, "start") and not getattr(speaker_stream, "active", False):
+                        speaker_stream.start()
+                except Exception as ex:
+                    logger.debug(f"[Barge-in Stream Restart Notice] {ex}")
+
+            # Signal interruption to Gemini Live server if session active
+            active_s = getattr(self, "_active_session", None)
+            if active_s and hasattr(active_s, "send"):
+                try:
+                    interrupt_content = types.LiveClientContent(turns=[], turn_complete=False)
+                    asyncio.run_coroutine_threadsafe(
+                        active_s.send(input=interrupt_content, end_of_turn=False),
+                        loop
+                    )
+                except Exception as send_ex:
+                    logger.debug(f"[Barge-in Server Signal Notice] {send_ex}")
+
+            if should_log:
+                logger.info(f"[⚡ Barge-in Triggered] Interrupted by {source} -> Cutting off audio playback instantly.")
+                print("\n[⚡ Barge-in Triggered] Interrupted by user speech!", flush=True)
+                with self._lock:
+                    self._session_transcript.append({"role": "user", "text": "[User interrupted model speech / Barge-in]"})
+
+        _handle_interruption = _trigger_barge_in
+        self._trigger_barge_in_fn = _trigger_barge_in
 
         def _set_ai_speaking(speaking: bool):
             if speaking:
@@ -578,17 +798,14 @@ class LiveCopilotSession:
             while active_event.is_set() and not self._stop_event.is_set():
                 try:
                     chunk = await asyncio.wait_for(audio_in_queue.get(), timeout=0.1)
-                    now_ts = time.perf_counter()
-                    is_speaker_active = self._is_speaking_active.is_set() or self._is_ai_speaking or (now_ts - getattr(self, "_last_ai_speech_end_time", 0.0) < 0.25)
-                    if is_speaker_active:
-                        # Full mic ducking / acoustic echo cancellation: force zero-PCM comfort silence to prevent audio feedback
-                        chunk = b"\x00" * len(chunk)
                     blob = types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
                     if hasattr(session, "send_realtime_input"):
                         await session.send_realtime_input(audio=blob)
                     else:
                         await session.send(input={"data": chunk, "mime_type": "audio/pcm;rate=16000"}, end_of_turn=False)
                     audio_in_queue.task_done()
+                    if chunk != b"\x00" * len(chunk):
+                        self.notify_traffic()
                 except asyncio.TimeoutError:
                     # Keep-Alive Silence Frame: Feed zero-PCM heartbeat on idle timeout to prevent WebSocket disconnection
                     try:
@@ -619,47 +836,119 @@ class LiveCopilotSession:
                         continue
 
         async def screen_vision_worker(session, active_event: asyncio.Event):
-            from src.screen_capture import get_monitor_dict
+            from src.zero_ui.fovea_capture import FoveaCapturePipeline, Point, Rect
+            from src.zero_ui.input_intent_detector import InputIntentDetector
+            import queue
+            import io
+            from PIL import Image
+
+            # Fovea Vision Pipeline — cursor-centric 1280×720 crop at 15–20 Hz
+            # Frame interval derived from FOVEA_CAPTURE_HZ (default 15 Hz → 0.067 s).
+            # Keep GEMINI_LIVE_FRAME_INTERVAL as a minimum floor to respect API rate limits.
+            capture_hz = max(1, int(getattr(config, "FOVEA_CAPTURE_HZ", 15)))
+            fovea_interval = 1.0 / capture_hz
+            api_floor = float(getattr(config, "GEMINI_LIVE_FRAME_INTERVAL", 0.067))
+            frame_interval = max(fovea_interval, api_floor)
+            jpeg_quality = min(60, max(40, int(getattr(config, "GEMINI_LIVE_JPEG_QUALITY", 50))))
+            move_threshold = int(getattr(config, "FOVEA_MOVE_THRESHOLD", 20))
+
+            pipeline = FoveaCapturePipeline(
+                fovea_width=1280,
+                fovea_height=720,
+                move_threshold=move_threshold,
+            )
+            
+            detector = InputIntentDetector()
+            intent_queue = queue.Queue()
+            
+            try:
+                from pynput import mouse
+                
+                def on_move(x, y):
+                    if detector.register_move(x, y):
+                        detector.clear_buffer()
+                        intent_queue.put({'type': 'cluster', 'point': (x, y)})
+
+                def on_click(x, y, button, pressed):
+                    if pressed:
+                        detector.register_mouse_down(x, y)
+                    else:
+                        result = detector.register_mouse_up(x, y)
+                        if result:
+                            intent_queue.put(result)
+                        else:
+                            intent_queue.put(detector.register_click(x, y))
+
+                mouse_listener = mouse.Listener(on_move=on_move, on_click=on_click)
+                mouse_listener.daemon = True
+                mouse_listener.start()
+                self._mouse_listener = mouse_listener
+            except ImportError:
+                logger.debug("[FoveaCapture] pynput not installed, mouse intent detection disabled.")
+                mouse_listener = None
+
             with mss.MSS() as sct:
-                # Strict 1 FPS cap (interval >= 1.0s) and 720p max resolution to prevent bandwidth throttling
-                frame_interval = max(1.0, float(getattr(config, "GEMINI_LIVE_FRAME_INTERVAL", 1.0)))
-                jpeg_quality = min(60, max(40, int(getattr(config, "GEMINI_LIVE_JPEG_QUALITY", 50))))
-                win_name = "Gemini Vision Stream"
                 try:
                     while active_event.is_set() and not self._stop_event.is_set():
                         try:
-                            # Dynamic monitor index lookup at runtime (Default: Monitor 1 UltraWide)
-                            cur_mon = self.target_monitor if self.target_monitor is not None else getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
-                            target_mon_idx = max(1, int(cur_mon))
+                            has_intent = False
+                            intent = None
+                            try:
+                                while not intent_queue.empty():
+                                    intent = intent_queue.get_nowait()
+                                    has_intent = True
+                            except queue.Empty:
+                                pass
+                                
+                            jpeg_bytes = None
+                            if has_intent and intent:
+                                try:
+                                    if intent['type'] == 'drag':
+                                        bbox = intent['bbox']
+                                        grab_rect = {"left": int(bbox[0]), "top": int(bbox[1]), "width": int(bbox[2]-bbox[0]), "height": int(bbox[3]-bbox[1])}
+                                        # Clamp slightly to ensure it doesn't crash on invalid boxes
+                                        if grab_rect["width"] > 0 and grab_rect["height"] > 0:
+                                            sct_img = sct.grab(grab_rect)
+                                            img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                                            buf = io.BytesIO()
+                                            img.save(buf, format="JPEG", quality=jpeg_quality)
+                                            jpeg_bytes = buf.getvalue()
+                                    else:
+                                        pt = intent['point']
+                                        cursor_pt = Point(int(pt[0]), int(pt[1]))
+                                        monitor = pipeline._find_monitor_for_cursor(sct, cursor_pt)
+                                        clamped_bbox = pipeline.compute_clamped_bbox(cursor_pt, monitor)
+                                        grab_rect = {"left": clamped_bbox.left, "top": clamped_bbox.top, "width": clamped_bbox.width, "height": clamped_bbox.height}
+                                        sct_img = sct.grab(grab_rect)
+                                        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                                        img = pipeline._draw_reticle(img, Point(cursor_pt.x - clamped_bbox.left, cursor_pt.y - clamped_bbox.top))
+                                        buf = io.BytesIO()
+                                        img.save(buf, format="JPEG", quality=jpeg_quality)
+                                        jpeg_bytes = buf.getvalue()
+                                except Exception as e:
+                                    logger.debug(f"[FoveaCapture] Intent capture error: {e}")
+                                    jpeg_bytes = None
 
-                            target_rect = get_monitor_dict(target_mon_idx, sct)
-                            if not target_rect:
-                                target_rect = sct.monitors[1] if len(sct.monitors) > 1 else {"top": 0, "left": 0, "width": 3440, "height": 1440}
+                            if not jpeg_bytes:
+                                # Standard debounce polling if no intent overrides it
+                                jpeg_bytes = pipeline.capture_fovea_frame(sct, jpeg_quality=jpeg_quality)
 
-                            sct_img = sct.grab(target_rect)
-                            if not sct_img or not hasattr(sct_img, "width") or not isinstance(getattr(sct_img, "width", None), int) or sct_img.width <= 0 or not hasattr(sct_img, "bgra") or not isinstance(sct_img.bgra, bytes):
-                                await asyncio.sleep(0.5)
+                            if not jpeg_bytes:
+                                await asyncio.sleep(frame_interval)
                                 continue
 
-                            img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-                            # Strict 720p cap (max width 1280, max height 720) to prevent bandwidth saturation
-                            if img.width > 1280 or img.height > 720:
-                                img.thumbnail((1280, 720), Image.Resampling.BILINEAR)
-
-                            buf = io.BytesIO()
-                            img.save(buf, format="JPEG", quality=jpeg_quality)
-                            jpeg_bytes = buf.getvalue()
                             blob = types.Blob(data=jpeg_bytes, mime_type="image/jpeg")
 
                             if hasattr(session, "send_realtime_input"):
                                 await session.send_realtime_input(video=blob)
                             else:
                                 await session.send(input={"data": jpeg_bytes, "mime_type": "image/jpeg"}, end_of_turn=False)
+                            self.notify_traffic()
 
                         except asyncio.CancelledError:
                             break
                         except Exception as ex:
-                            logger.debug(f"[Vision Grab Notice] {ex}")
+                            logger.debug(f"[Fovea Vision Notice] {ex}")
                             await asyncio.sleep(frame_interval)
                             continue
 
@@ -668,7 +957,13 @@ class LiveCopilotSession:
                         except asyncio.CancelledError:
                             break
                 finally:
-                    pass
+                    if mouse_listener:
+                        try:
+                            mouse_listener.stop()
+                        except Exception:
+                            pass
+                    if getattr(self, "_mouse_listener", None) == mouse_listener:
+                        self._mouse_listener = None
 
         async def audio_output_worker(out_stream, active_event: asyncio.Event):
             jitter_buf = bytearray()
@@ -677,7 +972,7 @@ class LiveCopilotSession:
             last_play_time = 0.0
 
             while active_event.is_set() and not self._stop_event.is_set():
-                if barge_in_event.is_set():
+                if barge_in_event.is_set() or turn_interrupted.is_set():
                     jitter_buf.clear()
                     is_buffering = True
                     _set_ai_speaking(False)
@@ -685,7 +980,7 @@ class LiveCopilotSession:
 
                 try:
                     audio_chunk = await asyncio.wait_for(audio_out_queue.get(), timeout=0.1)
-                    if barge_in_event.is_set():
+                    if barge_in_event.is_set() or turn_interrupted.is_set():
                         jitter_buf.clear()
                         is_buffering = True
                         _set_ai_speaking(False)
@@ -703,21 +998,32 @@ class LiveCopilotSession:
                             is_buffering = False
 
                     if not is_buffering or len(jitter_buf) >= min_jitter_bytes:
+                        if turn_interrupted.is_set():
+                            jitter_buf.clear()
+                            _set_ai_speaking(False)
+                            continue
                         chunk_to_play = bytes(jitter_buf)
                         jitter_buf.clear()
                         _set_ai_speaking(True)
                         last_play_time = time.perf_counter()
                         try:
                             await loop.run_in_executor(None, out_stream.write, chunk_to_play)
+                        except Exception as write_err:
+                            logger.debug(f"[Audio Out Write Notice] {write_err}")
+                            try:
+                                if hasattr(out_stream, "start") and not getattr(out_stream, "active", False):
+                                    out_stream.start()
+                            except Exception:
+                                pass
                         finally:
-                            if audio_out_queue.empty() and len(jitter_buf) == 0:
-                                _set_ai_speaking(False)
+                            last_play_time = time.perf_counter()
 
                 except asyncio.TimeoutError:
                     if barge_in_event.is_set():
                         jitter_buf.clear()
                         is_buffering = True
                         _set_ai_speaking(False)
+                        last_play_time = 0.0
                         barge_in_event.clear()
                         continue
 
@@ -729,12 +1035,23 @@ class LiveCopilotSession:
                         last_play_time = time.perf_counter()
                         try:
                             await loop.run_in_executor(None, out_stream.write, chunk_to_play)
+                        except Exception as write_err:
+                            logger.debug(f"[Audio Out Write Gap Notice] {write_err}")
+                            try:
+                                if hasattr(out_stream, "start") and not getattr(out_stream, "active", False):
+                                    out_stream.start()
+                            except Exception:
+                                pass
                         finally:
-                            if audio_out_queue.empty() and len(jitter_buf) == 0:
-                                _set_ai_speaking(False)
+                            last_play_time = time.perf_counter()
                     else:
-                        if audio_out_queue.empty() and (time.perf_counter() - last_play_time > 0.05):
-                            _set_ai_speaking(False)
+                        # Post-Playback Grace Period (Hangover Time):
+                        # When audio_out_queue is empty and playback finishes, keep zero-PCM
+                        # mute guard active for an additional 300ms before unmuting raw mic stream.
+                        if audio_out_queue.empty():
+                            if last_play_time == 0.0 or (time.perf_counter() - last_play_time >= 0.30):
+                                _set_ai_speaking(False)
+                                last_play_time = 0.0
                     is_buffering = True
                     continue
                 except asyncio.CancelledError:
@@ -765,29 +1082,19 @@ class LiveCopilotSession:
                             if server_content is not None:
                                 # Non-destructive Barge-in: flush active audio playback immediately without resetting socket connection
                                 if getattr(server_content, "interrupted", False) is True:
-                                    now = time.perf_counter()
-                                    is_active = self._is_ai_speaking or not audio_out_queue.empty()
-                                    if is_active and (now - self._last_barge_in_time > 1.0):
-                                        self._last_barge_in_time = now
-                                        self._is_ai_speaking = False
-                                        _flush_audio_out()
-                                        barge_in_event.set()
-                                        print("\n[⚡ Barge-in Triggered] Interrupted by user speech!", flush=True)
-                                        with self._lock:
-                                            self._session_transcript.append({"role": "user", "text": "[User interrupted model speech / Barge-in]"})
-                                    else:
-                                        self._is_ai_speaking = False
-                                        _flush_audio_out()
-                                        barge_in_event.set()
+                                    _trigger_barge_in("server_interrupted_flag")
                                     continue
 
                                 # Turn Complete: Model finished current response turn - maintain live connection
                                 if getattr(server_content, "turn_complete", False) is True:
                                     logger.debug("[LiveCopilot] Model turn complete. Stream active.")
+                                    turn_interrupted.clear()
                                     continue
 
                                 model_turn = getattr(server_content, "model_turn", None)
                                 if model_turn:
+                                    # Clear interruption lock on new model turn so response is never dropped
+                                    turn_interrupted.clear()
                                     for part in model_turn.parts:
                                         # Suppress thinking process text / thoughts to guarantee zero-latency voice output
                                         if getattr(part, "thought", False) is True:
@@ -802,9 +1109,13 @@ class LiveCopilotSession:
 
                                         if hasattr(part, "inline_data") and part.inline_data:
                                             audio_data = part.inline_data.data
-                                            if audio_data:
-                                                # Accept audio output when outside immediate barge-in recovery window (> 0.4s)
-                                                if time.perf_counter() - self._last_barge_in_time > 0.4:
+                                            if audio_data and not turn_interrupted.is_set():
+                                                self.notify_traffic()
+                                                # Accept audio output when outside immediate barge-in recovery window (> 0.2s)
+                                                if time.perf_counter() - self._last_barge_in_time > 0.20:
+                                                    # Eager Playback Mute: immediately engage zero-PCM mute guard before queuing chunk
+                                                    self._is_ai_speaking = True
+                                                    self._is_speaking_active.set()
                                                     try:
                                                         audio_out_queue.put_nowait(audio_data)
                                                     except (asyncio.QueueFull, Exception):
@@ -857,10 +1168,13 @@ class LiveCopilotSession:
                                     pass
                             conn_ctx = client.aio.live.connect(model=target_model, config=live_config)
                             session = await asyncio.wait_for(conn_ctx.__aenter__(), timeout=5.0)
+                            self._active_session = session
+                            self._active_conn_ctx = conn_ctx
                             try:
                                 logger.info(f"✅ [LiveCopilot Connected] Live session active on '{target_model}'")
                                 self._is_connected = True
                                 connected = True
+                                self.set_traffic_state(False)
                                 if hasattr(self, "on_connected") and self.on_connected:
                                     try:
                                         self.on_connected()
@@ -868,6 +1182,7 @@ class LiveCopilotSession:
                                         pass
                                 _clear_queues()
                                 barge_in_event.clear()
+                                turn_interrupted.clear()
                                 session_active_event.set()
                                 reconnect_delay = 1.0
 
@@ -889,10 +1204,15 @@ class LiveCopilotSession:
                                 for task in worker_tasks:
                                     if not task.done():
                                         task.cancel()
-                                await asyncio.gather(*worker_tasks, return_exceptions=True)
+                                results = await asyncio.gather(*worker_tasks, return_exceptions=True)
+                                for res in results:
+                                    if isinstance(res, (AssertionError, KeyboardInterrupt)):
+                                        raise res
                                 _clear_queues()
                                 break
                             finally:
+                                self._active_session = None
+                                self._active_conn_ctx = None
                                 try:
                                     await conn_ctx.__aexit__(None, None, None)
                                 except Exception:
@@ -904,7 +1224,7 @@ class LiveCopilotSession:
                                     await asyncio.sleep(0.5)
                                 except (asyncio.CancelledError, RuntimeError):
                                     break
-                        except KeyboardInterrupt:
+                        except (KeyboardInterrupt, AssertionError):
                             raise
                         except Exception as ex:
                             err_msg = str(ex)
@@ -950,15 +1270,31 @@ class LiveCopilotSession:
             self._is_running = False
             self._is_connected = False
             self._is_ai_speaking = False
-            try:
-                mic_stream.stop()
-                mic_stream.close()
-            except Exception:
-                pass
-            try:
-                speaker_stream.stop()
-                speaker_stream.close()
-            except Exception:
-                pass
+            for s in (mic_stream, speaker_stream):
+                try:
+                    if hasattr(s, "abort"):
+                        s.abort()
+                except Exception:
+                    pass
+                try:
+                    s.stop()
+                except Exception:
+                    pass
+                try:
+                    s.close()
+                except Exception:
+                    pass
             self._mic_stream = None
             self._speaker_stream = None
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    session = LiveCopilotSession()
+    try:
+        asyncio.run(session.run())
+    except KeyboardInterrupt:
+        logger.info("[LiveCopilot] Session stopped by user (KeyboardInterrupt).")

@@ -13,6 +13,7 @@ def restore_config():
         "GEMINI_LIVE_TARGET_MONITOR": config.GEMINI_LIVE_TARGET_MONITOR,
         "RMS_THRESHOLD": config.RMS_THRESHOLD,
         "GEMINI_LIVE_RMS_THRESHOLD": config.GEMINI_LIVE_RMS_THRESHOLD,
+        "GEMINI_LIVE_BARGE_IN_THRESHOLD": getattr(config, "GEMINI_LIVE_BARGE_IN_THRESHOLD", 3500.0),
         "VAD_SILENCE_MS": config.VAD_SILENCE_MS,
         "STT_ENGINE": config.STT_ENGINE,
         "TTS_VOICE": config.TTS_VOICE,
@@ -178,6 +179,8 @@ def test_app_dynamic_config_integration():
     
     orig_mon = config.GEMINI_LIVE_TARGET_MONITOR
     orig_rms = config.RMS_THRESHOLD
+    orig_live_rms = config.GEMINI_LIVE_RMS_THRESHOLD
+    orig_barge_in = getattr(config, "GEMINI_LIVE_BARGE_IN_THRESHOLD", 3500.0)
     orig_vad = config.VAD_SILENCE_MS
     orig_stt = config.STT_ENGINE
     orig_speed = config.TTS_SPEAKING_RATE
@@ -226,7 +229,8 @@ def test_app_dynamic_config_integration():
     finally:
         config.GEMINI_LIVE_TARGET_MONITOR = orig_mon
         config.RMS_THRESHOLD = orig_rms
-        config.GEMINI_LIVE_RMS_THRESHOLD = getattr(config, "GEMINI_LIVE_RMS_THRESHOLD", 2500.0)
+        config.GEMINI_LIVE_RMS_THRESHOLD = orig_live_rms
+        config.GEMINI_LIVE_BARGE_IN_THRESHOLD = orig_barge_in
         config.VAD_SILENCE_MS = orig_vad
         config.STT_ENGINE = orig_stt
         config.TTS_SPEAKING_RATE = orig_speed

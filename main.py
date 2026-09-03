@@ -27,8 +27,15 @@ elif hasattr(sys.stderr, "reconfigure"):
         pass
 
 # -------------------------------------------------------------------------
-# FAST-PATH BOOT SEQUENCE: Instant GUI Display (< 0.1s)
+# FAST-PATH BOOT SEQUENCE: Instant Single-Instance Guard & GUI Splash (< 0.1s)
 # -------------------------------------------------------------------------
+from src.single_instance import SingleInstanceGuard
+
+instance_guard = SingleInstanceGuard()
+if not instance_guard.acquire():
+    print("[SingleInstance Error] Another instance of Voice Operating Hub is already running. Exiting.", file=sys.stderr, flush=True)
+    sys.exit(0)
+
 print("[Startup] Instantiating Fast-Path HUD Splash...", flush=True)
 from src.hud_overlay import HUDOverlay, HUDState
 
@@ -49,6 +56,7 @@ if __name__ == "__main__":
     print("[Startup] Instantiating VoiceOperatingHubApp...", flush=True)
     try:
         app = VoiceOperatingHubApp(hud_overlay=hud)
+        app.single_instance_guard = instance_guard
         init_ms = (time.perf_counter() - t_app_init) * 1000
         print(f"[Startup Benchmark] VoiceOperatingHubApp instantiated in {init_ms:.1f}ms", flush=True)
 

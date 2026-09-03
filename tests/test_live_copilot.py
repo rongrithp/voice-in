@@ -665,271 +665,11 @@ def test_live_copilot_config_defaults():
     """Verify calibrated defaults for noise gate threshold and min speech frames in config."""
     import config
     assert getattr(config, "GEMINI_LIVE_RMS_THRESHOLD", None) == 2500.0
+    assert getattr(config, "GEMINI_LIVE_BARGE_IN_THRESHOLD", None) == 3500.0
     assert getattr(config, "GEMINI_LIVE_MIN_SPEECH_FRAMES", None) == 3
 
 
-@pytest.mark.anyio
-async def test_live_copilot_noise_gate_filters_continuous_fan_noise():
-    """Verify that continuous fan noise below RMS threshold (e.g. RMS ~1000 < 2500) produces only comfort silence frames."""
-    from unittest.mock import AsyncMock
-    import numpy as np
 
-    session = LiveCopilotSession(show_preview=False)
-    session._is_running = True
-
-    captured_inputs = []
-    mock_client = MagicMock()
-    mock_live_session = AsyncMock()
-
-    async def mock_send_realtime_input(**kwargs):
-        if "audio" in kwargs:
-            captured_inputs.append(kwargs["audio"].data)
-
-    mock_live_session.send_realtime_input = mock_send_realtime_input
-
-    captured_callback = None
-    def mock_raw_input_stream(*args, **kwargs):
-        nonlocal captured_callback
-        captured_callback = kwargs.get("callback")
-        return MagicMock()
-
-    mock_conn = AsyncMock()
-    mock_conn.__aenter__.return_value = mock_live_session
-    mock_conn.__aexit__.return_value = None
-    mock_client.aio.live.connect.return_value = mock_conn
-
-    session._client = mock_client
-    session._backend_desc = "Mock Direct"
-
-    async def mock_receive():
-        await asyncio.sleep(0.02)
-        # Generate 5 frames of fan noise: RMS ~1000 (int16 array with amplitude ~1000)
-        fan_noise = (np.ones(1024, dtype=np.int16) * 1000).tobytes()
-        for _ in range(5):
-            captured_callback(fan_noise, 1024, None, None)
-            await asyncio.sleep(0.02)
-
-        await asyncio.sleep(0.05)
-        session._stop_event.set()
-        session._is_running = False
-        if False:
-            yield None
-
-    mock_live_session.receive = mock_receive
-
-    with patch("sounddevice.RawInputStream", side_effect=mock_raw_input_stream), \
-         patch("sounddevice.RawOutputStream"), \
-         patch("mss.MSS"):
-        await session._async_live_loop()
-
-    assert len(captured_inputs) > 0
-    # Every frame sent to Gemini must be pure silence (zero-PCM), completely shielding Gemini from fan noise
-    for chunk in captured_inputs:
-        assert set(chunk) == {0}
-
-
-@pytest.mark.anyio
-async def test_live_copilot_transient_noise_spike_discarded():
-    """Verify that a 1-frame noise spike above threshold is discarded and only silence is streamed."""
-    from unittest.mock import AsyncMock
-    import numpy as np
-
-    session = LiveCopilotSession(show_preview=False)
-    session._is_running = True
-
-    captured_inputs = []
-    mock_client = MagicMock()
-    mock_live_session = AsyncMock()
-
-    async def mock_send_realtime_input(**kwargs):
-        if "audio" in kwargs:
-            captured_inputs.append(kwargs["audio"].data)
-
-    mock_live_session.send_realtime_input = mock_send_realtime_input
-
-    captured_callback = None
-    def mock_raw_input_stream(*args, **kwargs):
-        nonlocal captured_callback
-        captured_callback = kwargs.get("callback")
-        return MagicMock()
-
-    mock_conn = AsyncMock()
-    mock_conn.__aenter__.return_value = mock_live_session
-    mock_conn.__aexit__.return_value = None
-    mock_client.aio.live.connect.return_value = mock_conn
-
-    session._client = mock_client
-    session._backend_desc = "Mock Direct"
-
-    async def mock_receive():
-        await asyncio.sleep(0.02)
-        # 1 frame of spike (RMS=3500 > 2500)
-        spike_frame = (np.ones(1024, dtype=np.int16) * 3500).tobytes()
-        captured_callback(spike_frame, 1024, None, None)
-        await asyncio.sleep(0.02)
-
-        # Followed by silence (RMS=0)
-        silence_frame = (np.zeros(1024, dtype=np.int16)).tobytes()
-        for _ in range(3):
-            captured_callback(silence_frame, 1024, None, None)
-            await asyncio.sleep(0.02)
-
-        await asyncio.sleep(0.05)
-        session._stop_event.set()
-        session._is_running = False
-        if False:
-            yield None
-
-    mock_live_session.receive = mock_receive
-
-    with patch("sounddevice.RawInputStream", side_effect=mock_raw_input_stream), \
-         patch("sounddevice.RawOutputStream"), \
-         patch("mss.MSS"):
-        await session._async_live_loop()
-
-    # The 1-frame spike must never have been flushed as audio
-    assert len(captured_inputs) > 0
-    spike_bytes = (np.ones(1024, dtype=np.int16) * 3500).tobytes()
-    assert spike_bytes not in captured_inputs
-    for chunk in captured_inputs:
-        assert set(chunk) == {0}
-
-
-@pytest.mark.anyio
-async def test_live_copilot_consecutive_speech_frames_flush_and_stream():
-    """Verify that >= 3 consecutive frames of speech (~192ms) confirm speech intent and flush pre-speech buffer."""
-    from unittest.mock import AsyncMock
-    import numpy as np
-
-    session = LiveCopilotSession(show_preview=False)
-    session._is_running = True
-    session.enable_wind_filter = False
-
-    captured_inputs = []
-    mock_client = MagicMock()
-    mock_live_session = AsyncMock()
-
-    async def mock_send_realtime_input(**kwargs):
-        if "audio" in kwargs:
-            captured_inputs.append(kwargs["audio"].data)
-
-    mock_live_session.send_realtime_input = mock_send_realtime_input
-
-    captured_callback = None
-    def mock_raw_input_stream(*args, **kwargs):
-        nonlocal captured_callback
-        captured_callback = kwargs.get("callback")
-        return MagicMock()
-
-    mock_conn = AsyncMock()
-    mock_conn.__aenter__.return_value = mock_live_session
-    mock_conn.__aexit__.return_value = None
-    mock_client.aio.live.connect.return_value = mock_conn
-
-    session._client = mock_client
-    session._backend_desc = "Mock Direct"
-
-    async def mock_receive():
-        await asyncio.sleep(0.02)
-        # 3 consecutive speech frames (RMS=3600 > 2500) with distinct content
-        speech_1 = (np.ones(1024, dtype=np.int16) * 3601).tobytes()
-        speech_2 = (np.ones(1024, dtype=np.int16) * 3602).tobytes()
-        speech_3 = (np.ones(1024, dtype=np.int16) * 3603).tobytes()
-
-        captured_callback(speech_1, 1024, None, None)
-        await asyncio.sleep(0.01)
-        captured_callback(speech_2, 1024, None, None)
-        await asyncio.sleep(0.01)
-        captured_callback(speech_3, 1024, None, None)
-        await asyncio.sleep(0.05)
-
-        session._stop_event.set()
-        session._is_running = False
-        if False:
-            yield None
-
-    mock_live_session.receive = mock_receive
-
-    with patch("sounddevice.RawInputStream", side_effect=mock_raw_input_stream), \
-         patch("sounddevice.RawOutputStream"), \
-         patch("mss.MSS"):
-        await session._async_live_loop()
-
-    # Verify that all 3 speech frames (including buffered speech_1 and speech_2) were flushed to Gemini
-    assert len(captured_inputs) > 0
-    speech_1 = (np.ones(1024, dtype=np.int16) * 3601).tobytes()
-    speech_2 = (np.ones(1024, dtype=np.int16) * 3602).tobytes()
-    speech_3 = (np.ones(1024, dtype=np.int16) * 3603).tobytes()
-
-    assert speech_1 in captured_inputs
-    assert speech_2 in captured_inputs
-    assert speech_3 in captured_inputs
-    # Check ordering: speech_1 came before speech_2 before speech_3
-    idx1 = captured_inputs.index(speech_1)
-    idx2 = captured_inputs.index(speech_2)
-    idx3 = captured_inputs.index(speech_3)
-    assert idx1 < idx2 < idx3
-
-
-@pytest.mark.anyio
-async def test_live_copilot_aec_mute_guard_during_ai_speaking():
-    """Verify that when AI is speaking (self._is_ai_speaking=True), mic input is muted to comfort silence."""
-    from unittest.mock import AsyncMock
-    import numpy as np
-
-    session = LiveCopilotSession(show_preview=False)
-    session._is_running = True
-    session._is_ai_speaking = True  # AI is outputting audio (speaker active)
-
-    captured_inputs = []
-    mock_client = MagicMock()
-    mock_live_session = AsyncMock()
-
-    async def mock_send_realtime_input(**kwargs):
-        if "audio" in kwargs:
-            captured_inputs.append(kwargs["audio"].data)
-
-    mock_live_session.send_realtime_input = mock_send_realtime_input
-
-    captured_callback = None
-    def mock_raw_input_stream(*args, **kwargs):
-        nonlocal captured_callback
-        captured_callback = kwargs.get("callback")
-        return MagicMock()
-
-    mock_conn = AsyncMock()
-    mock_conn.__aenter__.return_value = mock_live_session
-    mock_conn.__aexit__.return_value = None
-    mock_client.aio.live.connect.return_value = mock_conn
-
-    session._client = mock_client
-    session._backend_desc = "Mock Direct"
-
-    async def mock_receive():
-        await asyncio.sleep(0.02)
-        # Even with high amplitude acoustic feedback (RMS=4000) from speakers
-        speaker_echo = (np.ones(1024, dtype=np.int16) * 4000).tobytes()
-        for _ in range(5):
-            captured_callback(speaker_echo, 1024, None, None)
-            await asyncio.sleep(0.01)
-
-        await asyncio.sleep(0.05)
-        session._stop_event.set()
-        session._is_running = False
-        if False:
-            yield None
-
-    mock_live_session.receive = mock_receive
-
-    with patch("sounddevice.RawInputStream", side_effect=mock_raw_input_stream), \
-         patch("sounddevice.RawOutputStream"), \
-         patch("mss.MSS"):
-        await session._async_live_loop()
-
-    # Verify that all audio chunks sent were converted to comfort silence (0-PCM) by the AEC Mute Guard
-    assert len(captured_inputs) > 0
-    for chunk in captured_inputs:
-        assert set(chunk) == {0}
 
 
 def test_live_copilot_stop_device_cleanup():
@@ -1087,3 +827,372 @@ def test_config_dsp_flags_propagate_into_session():
         f"session.wind_cutoff_hz ({session.wind_cutoff_hz}) must equal "
         f"LIVE_COPILOT_CONFIG['wind_filter_cutoff_hz'] ({expected_cutoff})"
     )
+
+
+@pytest.mark.anyio
+async def test_live_copilot_server_side_barge_in_interruption():
+    """Verify that user mic audio does NOT locally trigger barge-in cutoff (preventing AC/fan noise false positives),
+    and that immediate playback cutoff (aborting stream & purging audio) occurs when Gemini server sends interrupted=True."""
+    from unittest.mock import AsyncMock
+    import numpy as np
+
+    session = LiveCopilotSession(show_preview=False)
+
+    mock_client = MagicMock()
+    mock_live_session = AsyncMock()
+
+    server_responses = asyncio.Queue()
+
+    async def mock_receive():
+        while not session._stop_event.is_set():
+            try:
+                msg = await asyncio.wait_for(server_responses.get(), timeout=0.05)
+                yield msg
+            except asyncio.TimeoutError:
+                continue
+
+    mock_live_session.receive = mock_receive
+    mock_conn = AsyncMock()
+    mock_conn.__aenter__.return_value = mock_live_session
+    mock_conn.__aexit__.return_value = None
+    mock_client.aio.live.connect.return_value = mock_conn
+    session._client = mock_client
+    session._backend_desc = "Mock Direct"
+
+    captured_mic_cb = None
+    mock_out_stream = MagicMock()
+
+    def capture_mic_init(*args, **kwargs):
+        nonlocal captured_mic_cb
+        captured_mic_cb = kwargs.get("callback")
+        mock_in = MagicMock()
+        mock_in.__enter__.return_value = mock_in
+        return mock_in
+
+    def capture_out_init(*args, **kwargs):
+        mock_out = mock_out_stream
+        import time
+        mock_out.write.side_effect = lambda data: time.sleep(0.5)
+        mock_out.__enter__.return_value = mock_out
+        return mock_out
+
+    with patch("sounddevice.RawInputStream", side_effect=capture_mic_init), \
+         patch("sounddevice.RawOutputStream", side_effect=capture_out_init), \
+         patch("mss.MSS"):
+        session._is_running = True
+        loop_task = asyncio.create_task(session._async_live_loop())
+        await asyncio.sleep(0.05)
+
+        assert captured_mic_cb is not None
+        # Simulate AI speaking actively
+        session._is_ai_speaking = True
+        session._is_speaking_active.set()
+        for _ in range(20):
+            session._audio_out_queue.put_nowait(b"\x00" * 2048)
+
+        # 1. Loud continuous background noise (RMS ~ 7000) into mic
+        t = np.linspace(0, 0.064, 1024, endpoint=False)
+        loud_ambient_audio = (np.sin(2 * np.pi * 440 * t) * 10000).astype(np.int16).tobytes()
+
+        for _ in range(5):
+            captured_mic_cb(loud_ambient_audio, 1024, None, None)
+        await asyncio.sleep(0.05)
+
+        # Local RMS threshold must NOT cut off AI playback
+        assert session._is_ai_speaking is True
+        mock_out_stream.abort.assert_not_called()
+
+        # 2. Server detects user speech via neural VAD and sends server_content.interrupted = True
+        interrupt_response = MagicMock()
+        server_content = MagicMock()
+        server_content.interrupted = True
+        server_content.turn_complete = False
+        server_content.model_turn = None
+        interrupt_response.server_content = server_content
+
+        await server_responses.put(interrupt_response)
+        await asyncio.sleep(0.08)
+
+        # Playback must now be immediately cut off and hardware buffer aborted
+        assert session._is_ai_speaking is False
+        mock_out_stream.abort.assert_called()
+
+        session._stop_event.set()
+        session._is_running = False
+        await loop_task
+
+
+@pytest.mark.anyio
+async def test_live_copilot_aec_mute_guard_during_ai_speaking():
+    """Verify Acoustic Echo Guard: when AI is speaking (self._is_ai_speaking=True),
+    mic input is muted to comfort silence (all zeros) so Gemini does not hear itself.
+    When AI is silent (self._is_ai_speaking=False), raw mic PCM is passed through."""
+    from unittest.mock import AsyncMock
+    import numpy as np
+
+    session = LiveCopilotSession(show_preview=False)
+    session._is_running = True
+    session.enable_wind_filter = False
+
+    captured_inputs = []
+    mock_client = MagicMock()
+    mock_live_session = AsyncMock()
+
+    async def mock_send_realtime_input(**kwargs):
+        if "audio" in kwargs:
+            captured_inputs.append(kwargs["audio"].data)
+
+    mock_live_session.send_realtime_input = mock_send_realtime_input
+
+    captured_callback = None
+    def mock_raw_input_stream(*args, **kwargs):
+        nonlocal captured_callback
+        captured_callback = kwargs.get("callback")
+        mock_in = MagicMock()
+        mock_in.__enter__.return_value = mock_in
+        return mock_in
+
+    mock_conn = AsyncMock()
+    mock_conn.__aenter__.return_value = mock_live_session
+    mock_conn.__aexit__.return_value = None
+    mock_client.aio.live.connect.return_value = mock_conn
+
+    session._client = mock_client
+    session._backend_desc = "Mock Direct"
+
+    async def mock_receive():
+        await asyncio.sleep(0.02)
+        # Phase 1: AI speaking -> must send comfort silence (0-PCM)
+        session._is_ai_speaking = True
+        session._is_speaking_active.set()
+        speaker_echo = (np.ones(1024, dtype=np.int16) * 4000).tobytes()
+        captured_callback(speaker_echo, 1024, None, None)
+        await asyncio.sleep(0.02)
+
+        # Phase 2: AI silent -> must send raw mic PCM
+        session._is_ai_speaking = False
+        session._is_speaking_active.clear()
+        user_speech = (np.ones(1024, dtype=np.int16) * 2000).tobytes()
+        captured_callback(user_speech, 1024, None, None)
+        await asyncio.sleep(0.02)
+
+        session._stop_event.set()
+        session._is_running = False
+        if False:
+            yield None
+
+    mock_live_session.receive = mock_receive
+
+    with patch("sounddevice.RawInputStream", side_effect=mock_raw_input_stream), \
+         patch("sounddevice.RawOutputStream"), \
+         patch("mss.MSS"):
+        await session._async_live_loop()
+
+    assert len(captured_inputs) >= 2
+    # Chunks sent during AI speaking / heartbeat must be pure comfort silence
+    assert any(set(c) == {0} for c in captured_inputs)
+    # AI silent phase must contain user speech
+    user_speech = (np.ones(1024, dtype=np.int16) * 2000).tobytes()
+    assert user_speech in captured_inputs
+
+
+@pytest.mark.anyio
+async def test_live_copilot_interruption_state_machine_self_healing():
+    """Verify that after server_content.interrupted=True fires:
+    1. Audio output queue is purged.
+    2. Speaking flags are fully reset to False.
+    3. Subsequent model turns are received and output without zombie deadlock."""
+    from unittest.mock import AsyncMock
+    from types import SimpleNamespace
+
+    session = LiveCopilotSession(show_preview=False)
+    session._is_running = True
+
+    # Turn 1: AI speaking
+    part_1 = SimpleNamespace(thought=False, text="ประโยคแรก", inline_data=SimpleNamespace(data=b"audio_turn_1"))
+    resp_1 = SimpleNamespace(server_content=SimpleNamespace(interrupted=False, turn_complete=False, model_turn=SimpleNamespace(parts=[part_1])))
+
+    # Server interruption
+    resp_interrupted = SimpleNamespace(server_content=SimpleNamespace(interrupted=True, turn_complete=False, model_turn=None))
+
+    # Turn 2: New AI turn after interruption (should self-heal and not be blocked)
+    part_2 = SimpleNamespace(thought=False, text="ประโยคหลังขัดจังหวะ", inline_data=SimpleNamespace(data=b"audio_turn_2"))
+    resp_2 = SimpleNamespace(server_content=SimpleNamespace(interrupted=False, turn_complete=False, model_turn=SimpleNamespace(parts=[part_2])))
+
+    mock_client = MagicMock()
+    mock_live_session = AsyncMock()
+
+    events_received = []
+
+    async def mock_receive():
+        # Yield Turn 1
+        yield resp_1
+        await asyncio.sleep(0.02)
+        events_received.append("turn_1")
+
+        # Yield Interruption
+        yield resp_interrupted
+        await asyncio.sleep(0.02)
+        events_received.append("interrupted")
+        # Assert state is reset
+        assert session._is_ai_speaking is False
+        assert session._is_speaking_active.is_set() is False
+
+        # Yield Turn 2
+        yield resp_2
+        await asyncio.sleep(0.05)
+        events_received.append("turn_2")
+
+        session._stop_event.set()
+        session._is_running = False
+
+    mock_live_session.receive = mock_receive
+    mock_conn = AsyncMock()
+    mock_conn.__aenter__.return_value = mock_live_session
+    mock_conn.__aexit__.return_value = None
+    mock_client.aio.live.connect.return_value = mock_conn
+
+    session._client = mock_client
+    session._backend_desc = "Mock Direct"
+
+    mock_out = MagicMock()
+    mock_out.write = MagicMock()
+
+    with patch("sounddevice.RawInputStream"), \
+         patch("sounddevice.RawOutputStream", return_value=mock_out), \
+         patch("mss.MSS"), \
+         patch("builtins.print"):
+        await session._async_live_loop()
+
+    assert events_received == ["turn_1", "interrupted", "turn_2"]
+    # Verify that turn 2 text was appended to session transcript
+    transcripts = [t["text"] for t in session._session_transcript if t.get("role") == "model"]
+    assert any("ประโยคหลังขัดจังหวะ" in t for t in transcripts)
+
+
+def test_live_copilot_intent_override_threshold():
+    """Verify Vocal Barge-in via High-Threshold Energy Gate during AI Playback:
+    - Whenever playback is active (_is_ai_speaking=True or _is_speaking_active.set()):
+      - Frames with rms < 4000.0 yield zero-PCM (b"\x00" * len(raw_bytes)).
+      - 1st frame with rms >= 4000.0 yields zero-PCM (consecutive = 1 < 2).
+      - 2nd consecutive frame with rms >= 4000.0 passes raw mic PCM bytes upstream.
+      - A subsequent frame with rms < 4000.0 resets counter and yields zero-PCM.
+    - When playback is inactive, raw PCM passes through directly to audio_in_queue.
+    """
+    import asyncio
+    import numpy as np
+
+    session = LiveCopilotSession(show_preview=False)
+    session._is_running = True
+    session.enable_wind_filter = False
+
+    # Synchronous audio input queue to capture results directly
+    audio_in_queue = asyncio.Queue()
+    session._audio_in_queue = audio_in_queue
+
+    # Frame definitions:
+    low_rms_frame = np.full(1024, 500, dtype=np.int16).tobytes()
+    high_rms_frame_1 = np.full(1024, 8000, dtype=np.int16).tobytes()
+    high_rms_frame_2 = np.full(1024, 15000, dtype=np.int16).tobytes()
+
+    # --- Phase 1: Playback is Active (High-Threshold Energy Gate) ---
+    session._is_ai_speaking = True
+    session._is_speaking_active.set()
+
+    # 1. Low RMS frame during playback -> must yield zero-PCM
+    session.mic_callback(low_rms_frame, 1024, None, None)
+    assert audio_in_queue.get_nowait() == b"\x00" * len(low_rms_frame)
+    assert session._override_consecutive_frames == 0
+
+    # 2. 1st High RMS frame (>= 4000) during playback -> must yield zero-PCM (consecutive = 1 < 2)
+    session.mic_callback(high_rms_frame_1, 1024, None, None)
+    assert audio_in_queue.get_nowait() == b"\x00" * len(high_rms_frame_1)
+    assert session._override_consecutive_frames == 1
+
+    # 3. 2nd consecutive High RMS frame (>= 4000) during playback -> PASS raw PCM upstream for barge-in!
+    session.mic_callback(high_rms_frame_2, 1024, None, None)
+    assert audio_in_queue.get_nowait() == high_rms_frame_2
+    assert session._override_consecutive_frames == 2
+
+    # 4. Subsequent Low RMS frame (< 4000) -> resets consecutive counter to 0 and yields zero-PCM
+    session.mic_callback(low_rms_frame, 1024, None, None)
+    assert audio_in_queue.get_nowait() == b"\x00" * len(low_rms_frame)
+    assert session._override_consecutive_frames == 0
+
+    # --- Phase 2: Playback is Inactive (AI Silent) -> Passthrough ---
+    session._is_ai_speaking = False
+    session._is_speaking_active.clear()
+
+    # Low RMS frame when silent -> passes raw PCM directly
+    session.mic_callback(low_rms_frame, 1024, None, None)
+    assert audio_in_queue.get_nowait() == low_rms_frame
+    assert session._override_consecutive_frames == 0
+
+    # High RMS frame when silent -> passes raw PCM directly
+    session.mic_callback(high_rms_frame_1, 1024, None, None)
+    assert audio_in_queue.get_nowait() == high_rms_frame_1
+    assert session._override_consecutive_frames == 0
+
+
+@pytest.mark.anyio
+async def test_live_copilot_eager_playback_mute_and_hangover_grace_period():
+    """Verify:
+    1. Eager Playback Mute: receiving server audio chunk immediately sets _is_ai_speaking=True before playback starts.
+    2. Post-Playback Grace Period: when queue empties, _is_ai_speaking stays True for 300ms before returning to False.
+    """
+    from unittest.mock import AsyncMock
+    from types import SimpleNamespace
+
+    session = LiveCopilotSession(show_preview=False)
+    session._is_running = True
+
+    part = SimpleNamespace(thought=False, text="ทดสอบระบบ", inline_data=SimpleNamespace(data=b"\x01\x00" * 1000))
+    turn = SimpleNamespace(parts=[part])
+    resp = SimpleNamespace(server_content=SimpleNamespace(interrupted=False, model_turn=turn))
+
+    mock_client = MagicMock()
+    mock_live_session = AsyncMock()
+
+    observed_eager_mute = False
+    observed_in_grace_period = False
+    observed_post_grace_cleared = False
+
+    async def mock_receive():
+        yield resp
+        # 1. Check Eager Mute immediately after chunk arrival
+        nonlocal observed_eager_mute, observed_in_grace_period, observed_post_grace_cleared
+        observed_eager_mute = session._is_ai_speaking and session._is_speaking_active.is_set()
+
+        # 2. Wait until playback finishes writing (100ms) but within 300ms grace period
+        await asyncio.sleep(0.15)
+        observed_in_grace_period = session._is_ai_speaking and session._is_speaking_active.is_set()
+
+        # 3. Wait until after 300ms grace period expires (> 350ms total)
+        await asyncio.sleep(0.35)
+        observed_post_grace_cleared = not session._is_ai_speaking and not session._is_speaking_active.is_set()
+
+        session._stop_event.set()
+        session._is_running = False
+
+    mock_live_session.receive = mock_receive
+    mock_conn = AsyncMock()
+    mock_conn.__aenter__.return_value = mock_live_session
+    mock_conn.__aexit__.return_value = None
+    mock_client.aio.live.connect.return_value = mock_conn
+
+    session._client = mock_client
+    session._backend_desc = "Mock Direct"
+
+    with patch("sounddevice.RawInputStream"), \
+         patch("sounddevice.RawOutputStream"), \
+         patch("mss.MSS"), \
+         patch("builtins.print"):
+        await session._async_live_loop()
+
+    assert observed_eager_mute is True, "Eager Playback Mute must engage immediately upon receiving audio chunk"
+    assert observed_in_grace_period is True, "Mute guard must remain active during 300ms post-playback grace period"
+    assert observed_post_grace_cleared is True, "Speaking state must clear after 300ms grace period has elapsed"
+
+
+
+
