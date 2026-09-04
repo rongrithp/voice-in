@@ -1109,9 +1109,16 @@ class VoiceOperatingHubApp:
                         self.hard_abort_stt()
                         time.sleep(0.02)
 
-                    if self.live_session is not None and self.live_session.is_running:
-                        # Fully tear down active session
-                        logger.info("[Live Co-pilot] Stopping active Live session...")
+                    is_currently_active = (
+                        getattr(self, "fsm_state", "STANDBY") == "ACTIVE"
+                        or (self.live_session is not None and self.live_session.is_running)
+                    )
+
+                    if is_currently_active:
+                        # F20 Kill-Switch: Immediately abort active session/stream and revert to STANDBY
+                        logger.info("[Live Co-pilot FSM] F20 Kill-Switch pressed -> Reverting ACTIVE to STANDBY...")
+
+                        # 1. Dismiss HUD, screen border, and LEDs immediately
                         if hasattr(self, "hud_overlay") and self.hud_overlay:
                             self.hud_overlay.hide()
                         if hasattr(self, "screen_border") and self.screen_border:
@@ -1119,30 +1126,50 @@ class VoiceOperatingHubApp:
                         if hasattr(self, "robot_widget") and self.robot_widget:
                             self.robot_widget.set_state(RobotLEDState.OFF)
 
+                        # 2. Fully tear down active Gemini session / WebSocket streams
                         session_to_stop = self.live_session
                         self.live_session = None
                         self._fallback_live_copilot = None
-                        try:
-                            session_to_stop.stop()
-                        except Exception as ex:
-                            logger.debug(f"[Live Co-pilot Stop Notice]: {ex}")
-
-                        status_str = "STOPPED (OFF)"
-                    else:
-                        # Ensure any dead reference is cleaned up
-                        if self.live_session is not None:
+                        if session_to_stop is not None:
                             try:
-                                self.live_session.stop()
-                            except Exception:
-                                pass
-                            self.live_session = None
-                            self._fallback_live_copilot = None
+                                session_to_stop.stop()
+                            except Exception as ex:
+                                logger.debug(f"[Live Co-pilot Stop Notice]: {ex}")
 
-                        # Launch EXACTLY ONE instance of LiveCopilotSession
-                        logger.info("[Live Co-pilot] Launching new LiveCopilotSession singleton...")
+                        # 3. Clear audio queues and buffers
+                        with self.lock:
+                            self.session_audio_frames.clear()
+                        while not self.audio_queue.empty():
+                            try:
+                                self.audio_queue.get_nowait()
+                            except Exception:
+                                break
+
+                        # 4. Revert state to STANDBY
+                        self.fsm_state = "STANDBY"
+                        self.harvested_context = None
+                        status_str = "STANDBY (OFF)"
+                    else:
+                        # STANDBY -> ACTIVE: Capture window under cursor, launch HUD, begin streaming
+                        logger.info("[Live Co-pilot FSM] F20 Pressed -> Transitioning STANDBY to ACTIVE...")
+
+                        # 1. Capture window-level context under cursor (Zero-disk)
+                        try:
+                            sys_edge_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "windows-edge")
+                            if sys_edge_dir not in sys.path:
+                                sys.path.insert(0, sys_edge_dir)
+                            from visual_cortex import capture_window_at_cursor
+                            self.harvested_context = capture_window_at_cursor()
+                            logger.info(f"[Live Co-pilot FSM] Target context: '{self.harvested_context.get('title')}' ({self.harvested_context.get('process_name')})")
+                        except Exception as e:
+                            logger.debug(f"[Live Co-pilot FSM] Context harvest note: {e}")
+                            self.harvested_context = None
+
+                        # 2. Launch HUD in connecting state
                         if hasattr(self, "hud_overlay") and self.hud_overlay:
                             self.hud_overlay.show_live_connecting()
 
+                        # 3. Launch LiveCopilotSession singleton and stream to Gemini
                         cur_mon = getattr(config, "GEMINI_LIVE_TARGET_MONITOR", 1)
                         session = LiveCopilotSession(target_monitor=cur_mon)
                         self.live_session = session
@@ -1162,12 +1189,14 @@ class VoiceOperatingHubApp:
                         )
 
                         is_started = session.start()
+                        self.fsm_state = "ACTIVE" if is_started else "STANDBY"
                         status_str = "ACTIVE (🟢 ON)" if is_started else "FAILED TO START"
 
-                    logger.info(f"[Live Co-pilot] Session status toggled -> {status_str}")
+                    logger.info(f"[Live Co-pilot FSM] State is now: {getattr(self, 'fsm_state', 'STANDBY')} ({status_str})")
                     self.notify_live_copilot_toast(status_str)
             except Exception as ex:
                 logger.error(f"[Live Co-pilot Error] Failed to toggle live session: {ex}")
+                self.fsm_state = "STANDBY"
                 if hasattr(self, "hud_overlay") and self.hud_overlay:
                     self.hud_overlay.show_live_error()
             finally:

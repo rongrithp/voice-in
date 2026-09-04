@@ -1,13 +1,8 @@
+from __future__ import annotations
+
 """
 audio_recorder.py - Real-Time Audio Streamer & Push-to-Talk Subsystem
 Windows Edge Module: 16kHz 16-bit Mono PCM audio capture with cursor-anchored HUD feedback.
-
-Pipeline Specification:
-1. Push-to-Talk Trigger: Intercepts Ctrl + Alt + Space (Press to start recording, Release to stop).
-2. HUD Visual Indicator: Spawns THINKING (listening) state at cursor coordinate on key press.
-3. Audio Capture: Streams raw PCM at 16,000 Hz, 16-bit, 1-channel (Mono) via sounddevice + numpy.
-4. Export & Dispatch: On key release, packages in-memory WAV buffer, computes RMS energy / buffer size,
-   and reports completion to the Event Bus (http://127.0.0.1:8765/action).
 """
 
 import sys
@@ -20,9 +15,11 @@ import ctypes
 import threading
 import tempfile
 import argparse
+import collections
 import urllib.request
-import urllib.error
-from typing import Optional, Callable, Dict, Any, Tuple, List
+from typing import Optional, Callable, Dict, Any, List
+
+STTEngine = Any
 
 # Ensure UTF-8 output encoding on Windows console
 try:
@@ -42,8 +39,6 @@ import numpy as np
 import sounddevice as sd
 
 from hud_overlay import get_current_cursor_pos
-from terminal_actuator import spawn_hud_overlay
-from stt_engine import STTEngine, create_test_wav_buffer
 from intent_parser import IntentParser
 
 # Win32 Constants for Hotkey & Key State Polling
@@ -53,6 +48,7 @@ MOD_SHIFT = 0x0004
 MOD_NOREPEAT = 0x4000
 
 VK_SPACE = 0x20
+VK_F20 = 0x83
 VK_CONTROL = 0x11
 VK_MENU = 0x12  # Alt key
 
@@ -133,10 +129,225 @@ class AudioCaptureResult:
         )
 
 
+class UnifiedAudioStream:
+    """
+    Singleton / shared non-blocking audio capture stream.
+    Maintains a single open sd.InputStream across the entire process lifetime.
+    Broadcasts audio frames to registered subscriber callbacks.
+    Avoids opening conflicting microphone handles simultaneously.
+    """
+    _instance: Optional["UnifiedAudioStream"] = None
+    _singleton_lock = threading.Lock()
+
+    @classmethod
+    def get_instance(
+        cls,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        channels: int = DEFAULT_CHANNELS,
+        device: Optional[int] = None
+    ) -> "UnifiedAudioStream":
+        with cls._singleton_lock:
+            if cls._instance is None:
+                cls._instance = cls(sample_rate=sample_rate, channels=channels, device=device)
+            return cls._instance
+
+    def __init__(
+        self,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        channels: int = DEFAULT_CHANNELS,
+        device: Optional[int] = None,
+        blocksize: int = 1024
+    ):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.device = device
+        self.blocksize = blocksize
+
+        self._stream: Optional[sd.InputStream] = None
+        self._subscribers: List[Callable[[np.ndarray, bytes], None]] = []
+        self._lock = threading.RLock()
+        self._is_running = False
+        self._muted = False
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._is_running and self._stream is not None and getattr(self._stream, "active", False)
+
+    @property
+    def is_muted(self) -> bool:
+        with self._lock:
+            return self._muted
+
+    def set_muted(self, muted: bool):
+        """Mutes broadcasting to prevent acoustic feedback while speaker is playing."""
+        with self._lock:
+            self._muted = muted
+
+    def subscribe(self, callback: Callable[[np.ndarray, bytes], None]):
+        """Registers a callback receiving (chunk_np_int16, raw_bytes)."""
+        with self._lock:
+            if callback not in self._subscribers:
+                self._subscribers.append(callback)
+            if not self._is_running:
+                self.start()
+
+    def unsubscribe(self, callback: Callable[[np.ndarray, bytes], None]):
+        """Unregisters a subscriber callback."""
+        with self._lock:
+            if callback in self._subscribers:
+                self._subscribers.remove(callback)
+
+    def _audio_callback(self, indata: np.ndarray, frames: int, time_info: Any, status: sd.CallbackFlags):
+        if status:
+            sys.stderr.write(f"[UnifiedAudioStream Status] {status}\n")
+        with self._lock:
+            if self._muted:
+                return
+            callbacks = list(self._subscribers)
+
+        raw_bytes = indata.tobytes()
+        chunk_copy = indata.copy()
+        for cb in callbacks:
+            try:
+                cb(chunk_copy, raw_bytes)
+            except Exception as e:
+                sys.stderr.write(f"[UnifiedAudioStream] Subscriber error: {e}\n")
+
+    def start(self, asynchronous: bool = False) -> bool:
+        with self._lock:
+            if self._is_running and self._stream and getattr(self._stream, "active", False):
+                return True
+            self._is_running = True
+
+        def _do_open():
+            with self._lock:
+                if not self._is_running:
+                    return False
+                try:
+                    self._stream = sd.InputStream(
+                        samplerate=self.sample_rate,
+                        channels=self.channels,
+                        dtype="int16",
+                        blocksize=self.blocksize,
+                        device=self.device,
+                        callback=self._audio_callback
+                    )
+                    self._stream.start()
+                    self._is_running = True
+                    return True
+                except Exception as e:
+                    sys.stderr.write(f"[UnifiedAudioStream] Failed to open audio input stream: {e}\n")
+                    self._is_running = False
+                    return False
+
+        if asynchronous:
+            threading.Thread(target=_do_open, daemon=True, name="AudioStreamOpener").start()
+            return True
+        return _do_open()
+
+    def stop(self):
+        with self._lock:
+            self._is_running = False
+            if self._stream:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+
+    def record_speech_vad(
+        self,
+        silence_threshold_sec: float = 1.5,
+        timeout_sec: float = 12.0,
+        rms_threshold: float = 250.0,
+        stop_event: Optional[threading.Event] = None,
+        on_speech_detected: Optional[Callable[[], None]] = None
+    ) -> Optional[AudioCaptureResult]:
+        """
+        Records a single conversational speech turn with voice activity detection (VAD).
+        - Automatically detects when speech starts (energy >= rms_threshold).
+        - Cuts off recording once silence duration >= silence_threshold_sec (default 1.5s).
+        - Returns AudioCaptureResult when completed or None if timed out / aborted.
+        """
+        if not self.is_running:
+            self.start()
+
+        frames_lock = threading.Lock()
+        collected_frames: List[np.ndarray] = []
+        pre_roll: collections.deque = collections.deque(maxlen=8)
+        speech_detected = threading.Event()
+        speech_done = threading.Event()
+
+        last_speech_time = [0.0]
+        start_time = time.perf_counter()
+
+        def _collector(chunk: np.ndarray, raw_bytes: bytes):
+            rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2))) if len(chunk) > 0 else 0.0
+            is_voice = rms >= rms_threshold
+
+            with frames_lock:
+                if not speech_detected.is_set():
+                    pre_roll.append(chunk)
+                    if is_voice:
+                        speech_detected.set()
+                        last_speech_time[0] = time.perf_counter()
+                        collected_frames.extend(list(pre_roll))
+                        pre_roll.clear()
+                        if on_speech_detected:
+                            try:
+                                on_speech_detected()
+                            except Exception:
+                                pass
+                else:
+                    collected_frames.append(chunk)
+                    now = time.perf_counter()
+                    if is_voice:
+                        last_speech_time[0] = now
+                    else:
+                        if now - last_speech_time[0] >= silence_threshold_sec:
+                            speech_done.set()
+
+        self.subscribe(_collector)
+        try:
+            while True:
+                if stop_event and stop_event.is_set():
+                    break
+                if speech_done.is_set():
+                    break
+                elapsed = time.perf_counter() - start_time
+                if not speech_detected.is_set() and elapsed >= timeout_sec:
+                    break
+                if speech_detected.is_set() and elapsed >= 30.0:
+                    break
+                time.sleep(0.025)
+        finally:
+            self.unsubscribe(_collector)
+
+        with frames_lock:
+            if not collected_frames:
+                return None
+            audio_array = np.concatenate(collected_frames, axis=0)
+            raw_pcm = audio_array.tobytes()
+            duration_sec = len(raw_pcm) / (DEFAULT_SAMPLE_WIDTH * self.channels * self.sample_rate)
+            peak_amp = int(np.max(np.abs(audio_array))) if len(audio_array) > 0 else 0
+            rms = float(np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))) if len(audio_array) > 0 else 0.0
+
+            return AudioCaptureResult(
+                raw_pcm=raw_pcm,
+                sample_rate=self.sample_rate,
+                channels=self.channels,
+                duration_sec=duration_sec,
+                rms_energy=rms,
+                peak_amplitude=peak_amp
+            )
+
+
 class AudioRecorder:
     """
-    Non-blocking microphone audio recorder using sounddevice streaming callbacks.
-    Captures 16kHz 16-bit Mono PCM audio without blocking UI or thread execution.
+    Non-blocking microphone audio recorder using UnifiedAudioStream.
+    Captures 16kHz 16-bit Mono PCM audio without opening conflicting microphone handles.
     """
 
     def __init__(
@@ -149,78 +360,52 @@ class AudioRecorder:
         self.channels = channels
         self.device = device
 
-        self._stream: Optional[sd.InputStream] = None
         self._frames: List[np.ndarray] = []
         self._is_recording = False
         self._lock = threading.Lock()
         self._start_time: float = 0.0
+        self._stream = UnifiedAudioStream.get_instance(sample_rate=sample_rate, channels=channels, device=device)
 
     @property
     def is_recording(self) -> bool:
         return self._is_recording
 
-    def _audio_callback(self, indata: np.ndarray, frames: int, time_info: Any, status: sd.CallbackFlags):
-        """Streaming callback executed by PortAudio engine in background."""
-        if status:
-            sys.stderr.write(f"[AudioRecorder Status] {status}\n")
+    def _audio_callback(self, chunk: np.ndarray, raw_bytes: bytes):
         if self._is_recording:
             with self._lock:
-                self._frames.append(indata.copy())
+                self._frames.append(chunk)
 
     def start_recording(self) -> bool:
-        """Opens audio stream and starts buffering microphone audio chunks."""
         with self._lock:
             if self._is_recording:
                 return True
 
             self._frames = []
             self._start_time = time.perf_counter()
-
-            try:
-                self._stream = sd.InputStream(
-                    samplerate=self.sample_rate,
-                    channels=self.channels,
-                    dtype="int16",
-                    device=self.device,
-                    callback=self._audio_callback
-                )
-                self._stream.start()
-                self._is_recording = True
-                return True
-            except Exception as e:
-                sys.stderr.write(f"[AudioRecorder] Failed to start audio input stream: {e}\n")
-                self._is_recording = False
-                return False
+            self._is_recording = True
+            self._stream.subscribe(self._audio_callback)
+            return True
 
     def stop_recording(self) -> AudioCaptureResult:
-        """Stops audio stream, concatenates frames, and returns AudioCaptureResult."""
-        duration_sec = 0.0
         with self._lock:
             if not self._is_recording:
                 return AudioCaptureResult(raw_pcm=b"", sample_rate=self.sample_rate, channels=self.channels)
 
             self._is_recording = False
             duration_sec = time.perf_counter() - self._start_time
-
-            if self._stream:
-                try:
-                    self._stream.stop()
-                    self._stream.close()
-                except Exception:
-                    pass
-                self._stream = None
-
+            self._stream.unsubscribe(self._audio_callback)
             captured_chunks = self._frames
             self._frames = []
 
         if not captured_chunks:
             return AudioCaptureResult(raw_pcm=b"", sample_rate=self.sample_rate, channels=self.channels, duration_sec=duration_sec)
 
-        # Concatenate audio frames
-        audio_array = np.concatenate(captured_chunks, axis=0)
+        flat_chunks = [
+            c.flatten() if hasattr(c, "flatten") else np.asarray(c, dtype=np.int16).flatten()
+            for c in captured_chunks
+        ]
+        audio_array = np.concatenate(flat_chunks, axis=0) if flat_chunks else np.zeros(0, dtype=np.int16)
         raw_pcm = audio_array.tobytes()
-
-        # Compute audio signal metrics
         peak_amp = int(np.max(np.abs(audio_array))) if len(audio_array) > 0 else 0
         rms = float(np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))) if len(audio_array) > 0 else 0.0
 
@@ -234,12 +419,99 @@ class AudioRecorder:
         )
 
     def record_fixed_duration(self, duration_sec: float = 2.0) -> AudioCaptureResult:
-        """Synchronously records for a fixed duration (useful for verification and test runs)."""
         if not self.start_recording():
             return AudioCaptureResult(raw_pcm=b"", sample_rate=self.sample_rate, channels=self.channels)
-
         time.sleep(duration_sec)
         return self.stop_recording()
+
+
+class BackgroundWakeDetector:
+    """
+    Background subscriber to UnifiedAudioStream for voice wake detection in STANDBY.
+    Monitors live microphone buffer and triggers on 'เจมิไน' or 'เจมิไนมาช่วยหน่อย' or 'gemini help'.
+    """
+
+    WAKE_PHRASES = [
+        "เจมิไนมาช่วยหน่อย",
+        "เจมิไนช่วยหน่อย",
+        "เจมิไน",
+        "gemini help",
+        "gemini come help"
+    ]
+
+    def __init__(
+        self,
+        on_wake: Callable[[str], None],
+        stt_engine: Optional[STTEngine] = None,
+        rms_threshold: float = 250.0,
+        stream: Optional[UnifiedAudioStream] = None
+    ):
+        self.on_wake = on_wake
+        self.stt_engine = stt_engine
+        self.rms_threshold = rms_threshold
+        self.stream = stream or UnifiedAudioStream.get_instance()
+
+        self._active = False
+        self._enabled = False  # Deactivated: primary trigger is strictly F20
+        self._worker_thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def set_enabled(self, enabled: bool):
+        with self._lock:
+            self._enabled = enabled
+
+    def start(self, force_enable: bool = False):
+        """
+        Continuous background wake-word listening is deactivated to prevent
+        microphone resource contention and audio stream blocking.
+        F20 is the primary interaction switch.
+        """
+        if not force_enable:
+            sys.stdout.write("[BackgroundWakeDetector] Deactivated: Relying strictly on F20 primary switch.\n")
+            return
+        with self._lock:
+            if self._active:
+                return
+            self._active = True
+            self._enabled = True
+            if self.stt_engine is None:
+                self.stt_engine = STTEngine(model_size="base", device="cpu", compute_type="int8")
+            self._worker_thread = threading.Thread(target=self._run_loop, daemon=True, name="WakeDetectorWorker")
+            self._worker_thread.start()
+
+    def stop(self):
+        with self._lock:
+            self._active = False
+
+    def _run_loop(self):
+        while self._active:
+            if not self._enabled:
+                time.sleep(0.15)
+                continue
+
+            stop_ev = threading.Event()
+            result = self.stream.record_speech_vad(
+                silence_threshold_sec=0.8,
+                timeout_sec=3.0,
+                rms_threshold=self.rms_threshold,
+                stop_event=stop_ev
+            )
+
+            if not self._active or not self._enabled:
+                continue
+
+            if result and len(result.raw_pcm) > 0 and result.duration_sec >= 0.4:
+                try:
+                    stt_res = self.stt_engine.transcribe(result.wav_bytes)
+                    text = stt_res.text.strip().lower()
+                    if text:
+                        for phrase in self.WAKE_PHRASES:
+                            if phrase in text:
+                                print(f"\n[WakeWord] Triggered by audio input: \"{stt_res.text}\" (Matched: \"{phrase}\")")
+                                self.on_wake(stt_res.text)
+                                break
+                except Exception as e:
+                    sys.stderr.write(f"[BackgroundWakeDetector] Transcription note: {e}\n")
 
 
 class PushToTalkAudioListener:
@@ -254,7 +526,10 @@ class PushToTalkAudioListener:
         server_url: str = DEFAULT_SERVER_URL,
         on_capture_complete: Optional[Callable[[AudioCaptureResult], None]] = None,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
-        enable_stt: bool = True
+        enable_stt: bool = True,
+        vk: int = VK_SPACE,
+        modifiers: int = (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT),
+        hotkey_name: str = "Ctrl+Alt+Space"
     ):
         self.server_url = server_url
         self.on_capture_complete = on_capture_complete
@@ -262,6 +537,9 @@ class PushToTalkAudioListener:
         self.enable_stt = enable_stt
         self.stt_engine = STTEngine() if enable_stt else None
         self.intent_parser = IntentParser() if enable_stt else None
+        self.vk = vk
+        self.modifiers = modifiers
+        self.hotkey_name = hotkey_name
 
         self._user32 = ctypes.windll.user32
         self._kernel32 = ctypes.windll.kernel32
@@ -273,9 +551,9 @@ class PushToTalkAudioListener:
         self._hotkey_id = 1002
 
     def is_key_down(self) -> bool:
-        """Checks if Space key is currently held down using GetAsyncKeyState."""
-        space_pressed = bool(self._user32.GetAsyncKeyState(VK_SPACE) & 0x8000)
-        return space_pressed
+        """Checks if configured hotkey is currently held down using GetAsyncKeyState."""
+        key_pressed = bool(self._user32.GetAsyncKeyState(self.vk) & 0x8000)
+        return key_pressed
 
     def _notify_server(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Dispatches an event or action payload to the local server."""
@@ -347,6 +625,8 @@ class PushToTalkAudioListener:
             f"Buffer: {result.buffer_size_bytes} bytes (16kHz Mono)"
         )
         intent_id = "AUDIO_RECORD"
+        action_name = "Audio Recording"
+        auto_submit = True
 
         if self.enable_stt and self.stt_engine and len(result.raw_pcm) > 0:
             try:
@@ -357,8 +637,42 @@ class PushToTalkAudioListener:
                 if recognized_text:
                     intent_res = self.intent_parser.parse(recognized_text)
                     intent_id = intent_res.intent_id
+                    action_name = intent_res.action_name
                     action_command = intent_res.executable_command
-                    print(f"[PTT: Intent Parsed] {intent_res.summary()}")
+                    auto_submit = getattr(intent_res, "auto_submit", False)
+                    print(f"[PTT: Intent Parsed] {intent_res.summary()} (auto_submit={auto_submit})")
+
+                    if intent_id == "SESSION_STANDBY_DISMISS":
+                        # User said "พอแล้ว" / "ขอบคุณมาก" -> Standby Return
+                        try:
+                            from gemini_live_client import GeminiLiveClient
+                            from terminal_actuator import kill_all_hud_overlays
+                            live_cli = GeminiLiveClient()
+                            threading.Thread(target=live_cli.play_goodbye, daemon=True, name="GoodbyeAudioWorker").start()
+                            kill_all_hud_overlays()
+                            action_name = "Session Standby Return"
+                            action_command = "echo [COPILOT STANDBY] Session dismissed cleanly."
+                            auto_submit = True
+                        except Exception as dismiss_err:
+                            sys.stderr.write(f"[PushToTalk] Standby dismiss error: {dismiss_err}\n")
+                    elif intent_id == "GEMINI_LIVE_WAKE" or "เจมิไน" in recognized_text:
+                        # Automatically capture window at cursor and stream to Gemini Live with audio output
+                        try:
+                            from visual_cortex import look_at_cursor
+                            from gemini_live_client import GeminiLiveClient
+                            win_ctx = look_at_cursor()
+                            live_client = GeminiLiveClient()
+                            threading.Thread(
+                                target=live_client.execute_turn_sync,
+                                args=(recognized_text, win_ctx.get("image_bytes"), win_ctx, True),
+                                daemon=True,
+                                name="GeminiLiveWakeWorker"
+                            ).start()
+                            action_name = "Gemini Live Co-pilot Stream Active"
+                            action_command = f"echo [GEMINI LIVE STREAMING] Prompt: \"{recognized_text}\""
+                            auto_submit = True
+                        except Exception as live_err:
+                            sys.stderr.write(f"[PushToTalk] Gemini Live trigger error: {live_err}\n")
             except Exception as e:
                 sys.stderr.write(f"[PushToTalk] STT/Intent error: {e}\n")
 
@@ -368,13 +682,15 @@ class PushToTalkAudioListener:
             "mode": "ACTION",
             "stt_text": recognized_text,
             "intent_id": intent_id,
+            "action_name": action_name,
+            "auto_submit": auto_submit,
             "audio_report": result.to_dict(),
             "cursor_pos": cursor,
             "duration": 2.5
         })
 
         if server_resp:
-            print(f"[PTT: Server Response] HUD transition triggered (Exit {server_resp.get('exit_code')}).")
+            print(f"[PTT: Server Response] Status: {server_resp.get('status')} | Mode: {server_resp.get('mode')}")
 
         # 4. Callback hook for downstream consumers
         if self.on_capture_complete:
@@ -394,11 +710,12 @@ class PushToTalkAudioListener:
         res = self._user32.RegisterHotKey(
             None,
             self._hotkey_id,
-            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-            VK_SPACE
+            self.modifiers,
+            self.vk
         )
         if res == 0:
-            sys.stderr.write("[PushToTalk] RegisterHotKey failed.\n")
+            err = self._kernel32.GetLastError()
+            sys.stderr.write(f"[PushToTalk] RegisterHotKey ({self.hotkey_name}) failed with code {err}.\n")
             return
 
         self._is_active = True
@@ -483,7 +800,8 @@ def run_microphone_verification(duration: float = 2.0, server_url: str = DEFAULT
 
     # 3. Mock Audio Transcription Test (STTEngine)
     print("\n[3/4] Testing Mock Audio Transcription (STTEngine)...")
-    stt_engine = STTEngine(model_size="base", device="cpu", compute_type="int8")
+    stt_engine = STTEngine(use_fallback_only=True)
+
     mock_wav = create_test_wav_buffer(duration_sec=1.0)
     stt_res = stt_engine.transcribe(mock_wav)
     assert stt_res.success, f"STT failed: {stt_res.error_message}"

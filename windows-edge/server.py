@@ -143,17 +143,41 @@ class EventBusHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"status": "error", "message": "Missing 'command' field in payload"})
             return
 
-        # If a thinking HUD is currently active from Step 2, close it when action finishes
+        # Grab and reset active thinking HUD process if any
         thinking_proc = EventBusHandler.active_thinking_proc
         EventBusHandler.active_thinking_proc = None
 
-        if mode == "THINKING" and not thinking_proc:
-            thinking_proc = spawn_hud_overlay(
-                mode="THINKING",
-                text=f"> {command}\n[STATUS: EXECUTING...]",
-                duration=duration,
-                cursor_pos=cursor_pos
+        # Check for auto_submit flag from semantic memory
+        auto_submit = payload.get("auto_submit", True)
+        action_name = payload.get("action_name", payload.get("intent_id", "Execute Command"))
+        stt_text = payload.get("stt_text", "")
+
+        # If verification is required before OS execution
+        if not auto_submit and command and not command.startswith("echo [SAFE FALLBACK]"):
+            if thinking_proc and thinking_proc.poll() is None:
+                try:
+                    thinking_proc.terminate()
+                except Exception:
+                    pass
+
+            spawn_hud_overlay(
+                mode="CONFIRMATION",
+                duration=15.0,
+                cursor_pos=cursor_pos,
+                action_name=action_name,
+                command=command,
+                phrase=stt_text
             )
+            self._send_json(200, {
+                "status": "awaiting_confirmation",
+                "mode": "CONFIRMATION",
+                "action_name": action_name,
+                "command": command,
+                "phrase": stt_text,
+                "message": "Awaiting user confirmation (Y/N/A) via HUD",
+                "cursor_pos": cursor_pos
+            })
+            return
 
         # Execute terminal command
         result = self.actuator.execute_sync(command)

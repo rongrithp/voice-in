@@ -13,6 +13,11 @@ windows-edge/
 ├── audio_recorder.py       # Real-time 16kHz audio streamer & Push-to-Talk recorder
 ├── stt_engine.py           # Speech-to-Text engine (faster-whisper CPU int8)
 ├── intent_parser.py        # Bilingual (Thai/English) rule-based intent parser
+├── intent_memory.py        # Adaptive human-in-the-loop memory & rule persistence
+├── user_rules.json         # Dynamic persistent user-learned command mappings
+├── visual_cortex.py        # Agent's Eye Sensory Module: Zero-disk window capture at cursor gaze
+├── live_copilot_fsm.py     # Live Co-pilot FSM state-toggle (Wake <-> Standby) via F20
+├── gemini_live_client.py   # Gemini Live Multimodal WebSocket client with Context Fusion
 ├── hotkey_listener.py      # Non-blocking global hotkey listener & voice mock
 ├── test_trigger.py         # Client verification script for Event Bus
 ├── main.py                 # Unified background launcher, test runner, and daemon
@@ -34,6 +39,14 @@ The HUD utilizes a full-screen, frameless, transparent, always-on-top window con
 - Displays high-contrast monospace text (Consolas / Cascadia) with syntax accents for cognitive anchoring during execution.
 - Smart screen edge detection prevents overflow beyond monitor borders.
 - Safely auto-closes after 2.5 seconds (or configured duration).
+
+### 3. `CONFIRMATION` Mode (Adaptive Verification)
+- Renders an amber target circle around the cursor and an interactive floating card:
+  `เข้าใจว่า: [Action Name] | [Y] ใช่ / [N] ไม่ใช่ / [A] จำไว้เสมอ`
+- Listens for global hotkeys without focus stealing:
+  - **[Y]**: Execute command once.
+  - **[N]**: Cancel execution and briefly show cancelled HUD.
+  - **[A]**: Save phrase to `user_rules.json` with `auto_submit=True`, execute immediately, and bypass confirmation in future sessions.
 
 ## Subprocess Actuator (`terminal_actuator.py`)
 
@@ -111,6 +124,18 @@ python windows-edge/intent_parser.py --text "เปิดบราวเซอ�
 python windows-edge/intent_parser.py --text "check git status"
 ```
 
+### Adaptive Semantic Memory (`intent_memory.py`)
+```powershell
+# Run automated memory & pipeline verification tests
+python windows-edge/intent_memory.py --test
+
+# List stored user rules
+python windows-edge/intent_memory.py --list
+
+# Clear learned rules
+python windows-edge/intent_memory.py --clear
+```
+
 ### Live Voice-In Daemon Launcher
 ```powershell
 # One-click batch launcher
@@ -121,5 +146,32 @@ python windows-edge/main.py --live
 
 # Run startup and health check
 python windows-edge/main.py --live-check
+```
+
+### Visual Cortex (`visual_cortex.py`)
+```powershell
+# Run automated window screen capture test with 2s countdown
+python windows-edge/visual_cortex.py --test
+
+# Immediate capture and print window metadata JSON
+python windows-edge/visual_cortex.py
+```
+
+### Live Co-pilot FSM & F20 State-Toggle (`live_copilot_fsm.py`)
+```powershell
+# Run automated F20 toggle & kill-switch verification suite
+python windows-edge/live_copilot_fsm.py --test
+
+# Run background F20 hotkey daemon
+python windows-edge/live_copilot_fsm.py
+```
+
+### Gemini Live Multimodal Pipeline (`gemini_live_client.py`)
+```powershell
+# Run automated end-to-end multimodal verification test (Context Fusion + Audio Playback)
+python windows-edge/gemini_live_client.py --test
+
+# Ask Gemini Live about the active window under cursor with voice response
+python windows-edge/gemini_live_client.py --query "หน้าต่างนี้คืออะไร สรุปสั้นๆ"
 ```
 

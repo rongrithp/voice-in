@@ -268,7 +268,8 @@ def test_dashboard_gui_update_preview_thumbnails():
     }
 
     img = Image.new("RGB", (180, 100), color="blue")
-    with patch("src.screen_capture.grab_monitor_thumbnail", return_value=img):
+    with patch("src.screen_capture.grab_monitor_thumbnail", return_value=img), \
+         patch("src.gui_dashboard.ctk"):
         gui._update_preview()
         mock_thumb_lbl.configure.assert_called()
         assert gui._monitor_cards[1]["image_ref"] is not None

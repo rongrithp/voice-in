@@ -61,15 +61,92 @@ class ActuatorResult:
         }
 
 
+import atexit
+import ctypes
+from ctypes import wintypes
+
+_ACTIVE_HUD_PROCESSES = set()
+_JOB_OBJECT = None
+
+
+def ensure_job_object():
+    """Binds current process to a Win32 Job Object with KILL_ON_JOB_CLOSE so child HUD processes never become zombies."""
+    global _JOB_OBJECT
+    if _JOB_OBJECT is not None or sys.platform != "win32":
+        return _JOB_OBJECT
+    try:
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ('PerProcessUserTimeLimit', wintypes.LARGE_INTEGER),
+                ('PerJobUserTimeLimit', wintypes.LARGE_INTEGER),
+                ('LimitFlags', wintypes.DWORD),
+                ('MinimumWorkingSetSize', ctypes.c_size_t),
+                ('MaximumWorkingSetSize', ctypes.c_size_t),
+                ('ActiveProcessLimit', wintypes.DWORD),
+                ('Affinity', ctypes.c_size_t),
+                ('PriorityClass', wintypes.DWORD),
+                ('SchedulingClass', wintypes.DWORD),
+            ]
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ('ReadOperationCount', ctypes.c_uint64),
+                ('WriteOperationCount', ctypes.c_uint64),
+                ('OtherOperationCount', ctypes.c_uint64),
+                ('ReadTransferCount', ctypes.c_uint64),
+                ('WriteTransferCount', ctypes.c_uint64),
+                ('OtherTransferCount', ctypes.c_uint64),
+            ]
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ('BasicLimitInformation', JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ('IoCounters', IO_COUNTERS),
+                ('ProcessMemoryLimit', ctypes.c_size_t),
+                ('JobMemoryLimit', ctypes.c_size_t),
+                ('PeakProcessMemoryLimit', ctypes.c_size_t),
+                ('PeakJobMemoryLimit', ctypes.c_size_t),
+            ]
+
+        job = ctypes.windll.kernel32.CreateJobObjectW(None, None)
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ctypes.windll.kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
+        ctypes.windll.kernel32.AssignProcessToJobObject(job, ctypes.windll.kernel32.GetCurrentProcess())
+        _JOB_OBJECT = job
+    except Exception:
+        pass
+    return _JOB_OBJECT
+
+
+def kill_all_hud_overlays():
+    """Forcibly terminates all registered HUD overlay processes."""
+    for proc in list(_ACTIVE_HUD_PROCESSES):
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.kill()
+        except Exception:
+            pass
+        _ACTIVE_HUD_PROCESSES.discard(proc)
+
+
+atexit.register(kill_all_hud_overlays)
+
+
 def spawn_hud_overlay(
     mode: str = "ACTION",
     text: Optional[str] = None,
-    duration: float = 2.5,
-    cursor_pos: Optional[Tuple[int, int]] = None
+    duration: float = 3.0,
+    cursor_pos: Optional[Tuple[int, int]] = None,
+    action_name: Optional[str] = None,
+    command: Optional[str] = None,
+    phrase: Optional[str] = None,
+    subtitle: Optional[str] = None,
+    target_box: Optional[Tuple[float, float, float, float]] = None
 ) -> Optional[subprocess.Popen]:
     """
-    Spawns hud_overlay.py in a detached non-blocking process so caller thread never stalls.
-    Supports passing optional cursor coordinates (x, y) or autodetecting in HUD process.
+    Spawns a detached HUD overlay process in a separate non-blocking execution context.
+    Supports ACTION, THINKING, ERROR, CONFIRMATION, LISTENING, and SPEAKING states.
+    Automatically tracked and bound to Job Object to guarantee zero zombie processes on exit.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     hud_script = os.path.join(script_dir, "hud_overlay.py")
@@ -84,20 +161,33 @@ def spawn_hud_overlay(
         cmd.extend(["--text", text])
     if cursor_pos is not None:
         cmd.extend(["--x", str(cursor_pos[0]), "--y", str(cursor_pos[1])])
+    if action_name:
+        cmd.extend(["--action-name", action_name])
+    if command:
+        cmd.extend(["--command", command])
+    if phrase:
+        cmd.extend(["--phrase", phrase])
+    if subtitle:
+        cmd.extend(["--subtitle", subtitle])
+    if target_box is not None:
+        cmd.extend(["--target-box", f"{target_box[0]},{target_box[1]},{target_box[2]},{target_box[3]}"])
 
     try:
-        # Launch without creating a visible console window (DETACHED_PROCESS / CREATE_NO_WINDOW)
         creation_flags = 0
         if sys.platform == "win32":
             creation_flags = subprocess.CREATE_NO_WINDOW
 
+        ensure_job_object()
+
         proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=creation_flags,
             close_fds=True
         )
+        _ACTIVE_HUD_PROCESSES.add(proc)
         return proc
     except Exception as e:
         sys.stderr.write(f"[Actuator] Failed to spawn HUD overlay: {e}\n")

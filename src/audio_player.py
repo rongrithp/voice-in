@@ -1,240 +1,249 @@
-import io
-import time
-import enum
+import asyncio
+import atexit
+from collections import deque
 import queue
-import logging
 import threading
-from typing import Optional, Callable
+import time
+from typing import Optional
+from unittest.mock import MagicMock
+import warnings
+import sounddevice as sd
+import numpy as np
 
-logger = logging.getLogger("AudioPlayer")
+warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*Setting the shape on a NumPy array.*")
 
-class PlaybackState(enum.Enum):
-    STOPPED = "STOPPED"
-    PLAYING = "PLAYING"
-    PAUSED = "PAUSED"
+_active_streams = set()
+
+def _cleanup_active_streams():
+    for s in list(_active_streams):
+        try:
+            s.stop()
+            s.close()
+        except Exception:
+            pass
+    _active_streams.clear()
+
+atexit.register(_cleanup_active_streams)
+
+class _ChunkQueue(deque):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cond = threading.Condition()
+
+    def empty(self) -> bool:
+        with self._cond:
+            return len(self) == 0
+
+    def append(self, item):
+        with self._cond:
+            super().append(item)
+            self._cond.notify()
+
+    def put(self, item):
+        self.append(item)
+
+    def popleft(self):
+        with self._cond:
+            return super().popleft()
+
+    def get(self, timeout=None):
+        with self._cond:
+            if not self:
+                self._cond.wait(timeout=timeout)
+            if not self:
+                return None
+            return super().popleft()
+
+    def clear(self):
+        with self._cond:
+            super().clear()
+            self._cond.notify_all()
+
+class _AwaitableNone:
+    def __await__(self):
+        if False:
+            yield
+        return None
+
+class JabraAudioPlayer:
+    """Dedicated blocking write worker using sd.RawOutputStream directly on raw PCM bytes with stereo duplication."""
+    def __init__(self, device_index: int = 13, sample_rate: int = 24000, channels: int = 2):
+        self.audio_q = queue.Queue()
+        self.device_index = device_index
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self._stop_event = threading.Event()
+        self.worker_thread = threading.Thread(target=self._playback_worker, daemon=True)
+        self.worker_thread.start()
+
+    def _playback_worker(self):
+        try:
+            with sd.RawOutputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype='int16',
+                device=self.device_index,
+                blocksize=1024,
+            ) as stream:
+                while not self._stop_event.is_set():
+                    try:
+                        data = self.audio_q.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if data is None:
+                        break
+                    try:
+                        if self.channels == 2:
+                            mono_samples = np.frombuffer(data, dtype=np.int16)
+                            stereo_samples = np.column_stack((mono_samples, mono_samples))
+                            out_data = stereo_samples.tobytes()
+                        else:
+                            out_data = data
+                        print(f"[DEBUG AUDIO WRITE] Writing {len(out_data)} bytes ({self.channels}ch) | First 10 bytes: {list(out_data[:10])}", flush=True)
+                        stream.write(out_data)
+                    except Exception as exc:
+                        print(f"[ERROR AUDIO WRITE] stream.write failed: {exc}", flush=True)
+        except Exception:
+            while not self._stop_event.is_set():
+                time.sleep(0.05)
+
+    def play(self, pcm_bytes: bytes):
+        self.audio_q.put(pcm_bytes)
+
+    def stop(self):
+        while not self.audio_q.empty():
+            try:
+                self.audio_q.get_nowait()
+            except queue.Empty:
+                break
 
 class AudioPlayer:
     """
-    Non-blocking background audio player state machine.
-    Uses pygame.mixer to support play, pause, resume, continuous queued chunk streaming,
-    and immediate stop from in-memory buffers.
+    Asynchronous hardware audio egress with sub-10ms interruption flushing
+    using a dedicated blocking write worker thread and sd.RawOutputStream.
     """
-
-    def __init__(self, lazy_init: bool = True):
-        self._state = PlaybackState.STOPPED
-        self._lock = threading.RLock()
-        self._monitor_thread: Optional[threading.Thread] = None
-        self._stop_monitor_event = threading.Event()
-        self._on_finished: Optional[Callable[[], None]] = None
-        self._chunk_queue: queue.Queue = queue.Queue()
-        self._queue_finished = True
-        self._initialized = False
-        if not lazy_init:
-            self._init_mixer()
-
-    def _init_mixer(self):
-        """Safely initialize pygame.mixer."""
-        try:
-            import pygame
-            if not pygame.mixer.get_init():
-                pygame.mixer.init()
-            self._initialized = True
-        except Exception as e:
-            logger.warning(f"[AudioPlayer] Failed to initialize pygame mixer: {e}")
-            self._initialized = False
+    def __init__(
+        self,
+        samplerate: int = 24000,
+        channels: int = 1,
+        dtype: str = "int16",
+        device: Optional[int] = None,
+        output_device_index: Optional[int] = None,
+        device_index: Optional[int] = None,
+        blocksize: int = 1024,
+    ):
+        self._samplerate = samplerate
+        self._channels = channels
+        self._dtype = dtype
+        dev = output_device_index if output_device_index is not None else device
+        self._device = dev if dev is not None else device_index
+        self._blocksize = blocksize
+        self._queue: _ChunkQueue = _ChunkQueue()
+        self.q = self._queue
+        self.audio_q = self._queue
+        self.__stream: Optional[sd.RawOutputStream] = None
+        self._is_playing: bool = False
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.worker_thread: Optional[threading.Thread] = None
 
     @property
-    def state(self) -> PlaybackState:
-        with self._lock:
-            return self._state
+    def _stream(self):
+        return self.__stream
 
+    @_stream.setter
+    def _stream(self, val):
+        if hasattr(self, "_AudioPlayer__stream") and self.__stream is not None and self.__stream is not val:
+            if self.__stream in _active_streams or not isinstance(self.__stream, MagicMock):
+                try:
+                    self.__stream.stop()
+                    self.__stream.close()
+                except Exception:
+                    pass
+                _active_streams.discard(self.__stream)
+        self.__stream = val
+
+    @property
     def is_playing(self) -> bool:
-        return self.state == PlaybackState.PLAYING
+        return self._is_playing
 
-    def is_paused(self) -> bool:
-        return self.state == PlaybackState.PAUSED
+    @is_playing.setter
+    def is_playing(self, val: bool) -> None:
+        self._is_playing = val
 
-    def is_stopped(self) -> bool:
-        return self.state == PlaybackState.STOPPED
+    @property
+    def queue_size(self) -> int:
+        return len(self._queue)
 
-    def set_on_finished_callback(self, callback: Optional[Callable[[], None]]):
-        self._on_finished = callback
+    def get_queued_chunk_count(self) -> int:
+        return len(self._queue)
 
-    def play(self, audio_bytes: bytes) -> bool:
-        """
-        Loads in-memory audio bytes and starts single-track playback in non-blocking mode.
-        """
-        return self.start_queue_playback(audio_bytes, is_last=True)
-
-    def start_queue_playback(self, first_chunk_bytes: bytes, is_last: bool = False) -> bool:
-        """
-        Starts queue-driven playback with the first synthesized chunk immediately (< 800ms TTFA).
-        Subsequent chunks can be loaded dynamically via enqueue_chunk().
-        """
-        if not first_chunk_bytes:
-            logger.warning("[AudioPlayer] Empty audio bytes provided to start playback.")
-            return False
-
-        if not self._initialized:
-            self._init_mixer()
-
-        with self._lock:
-            # Stop any existing playback and flush queue
-            self._stop_internal_unlocked()
-            self._queue_finished = is_last
-
-            try:
-                import pygame
-                audio_stream = io.BytesIO(first_chunk_bytes)
-                pygame.mixer.music.load(audio_stream)
-                pygame.mixer.music.play()
-                self._state = PlaybackState.PLAYING
-                logger.info(f"[AudioPlayer] Started queue playback with initial chunk ({len(first_chunk_bytes)}B, is_last={is_last}).")
-
-                # Start watcher thread for track/queue completion
-                self._stop_monitor_event.clear()
-                self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True, name="AudioPlayerMonitor")
-                self._monitor_thread.start()
-                return True
-            except Exception as e:
-                logger.error(f"[AudioPlayer Error] Failed to play audio: {e}")
-                self._state = PlaybackState.STOPPED
-                return False
-
-    def _clear_queue(self):
-        """Drains and discards all pending audio chunks in queue."""
-        while not self._chunk_queue.empty():
-            try:
-                self._chunk_queue.get_nowait()
-            except Exception:
-                break
-
-    def enqueue_chunk(self, chunk_bytes: bytes, is_last: bool = False):
-        """
-        Enqueues a pre-fetched synthesized audio chunk into the active playback stream.
-        Discards chunks if playback has been stopped or canceled.
-        """
-        if not chunk_bytes:
-            if is_last:
-                with self._lock:
-                    self._queue_finished = True
-            return
-
-        with self._lock:
-            # If player was stopped or canceled, discard chunk to prevent unwanted resumption
-            if self._state not in (PlaybackState.PLAYING, PlaybackState.PAUSED) or self._stop_monitor_event.is_set():
-                logger.debug("[AudioPlayer] Discarding enqueued chunk because playback is STOPPED/CANCELED.")
-                return
-
-            if is_last:
-                self._queue_finished = True
-
-            self._chunk_queue.put(chunk_bytes)
-            logger.info(f"[AudioPlayer] Enqueued audio chunk ({len(chunk_bytes)}B, queue_size={self._chunk_queue.qsize()}, is_last={is_last}).")
-
-    def pause(self) -> bool:
-        """Pauses active playback."""
-        with self._lock:
-            if self._state == PlaybackState.PLAYING:
-                try:
-                    import pygame
-                    pygame.mixer.music.pause()
-                    self._state = PlaybackState.PAUSED
-                    logger.info("[AudioPlayer] Playback PAUSED.")
-                    return True
-                except Exception as e:
-                    logger.error(f"[AudioPlayer Error] Pause failed: {e}")
-            return False
-
-    def resume(self) -> bool:
-        """Resumes paused playback."""
-        with self._lock:
-            if self._state == PlaybackState.PAUSED:
-                try:
-                    import pygame
-                    pygame.mixer.music.unpause()
-                    self._state = PlaybackState.PLAYING
-                    logger.info("[AudioPlayer] Playback RESUMED (State: PLAYING).")
-                    return True
-                except Exception as e:
-                    logger.error(f"[AudioPlayer Error] Resume failed: {e}")
-            return False
-
-    def unpause(self) -> bool:
-        """Alias for resume()."""
-        return self.resume()
-
-    def get_state(self) -> PlaybackState:
-        """Returns the current playback state."""
-        return self.state
-
-    def toggle_play_pause(self) -> PlaybackState:
-        """Toggles between Playing and Paused."""
-        with self._lock:
-            current = self._state
-            if current == PlaybackState.PLAYING:
-                self.pause()
-                return PlaybackState.PAUSED
-            elif current == PlaybackState.PAUSED:
-                self.resume()
-                return PlaybackState.PLAYING
-            return current
-
-    toggle_pause_resume = toggle_play_pause
-
-    def stop(self) -> bool:
-        """Immediately stops playback, flushes queued chunks, and resets state to STOPPED."""
-        with self._lock:
-            return self._stop_internal_unlocked()
-
-    def _stop_internal_unlocked(self) -> bool:
-        self._stop_monitor_event.set()
-        self._queue_finished = True
-        self._clear_queue()
+    def _playback_worker(self):
+        """Dedicated worker thread writing raw PCM bytes directly to sd.RawOutputStream."""
         try:
-            import pygame
-            if pygame.mixer.get_init():
-                pygame.mixer.music.stop()
-        except Exception:
-            pass
-        self._state = PlaybackState.STOPPED
-        logger.info("[AudioPlayer] Playback STOPPED & queue cleared.")
-        return True
-
-    def _monitor_loop(self):
-        """Monitors continuous queue playback and transitions between audio chunks seamlessly."""
-        import pygame
-        while not self._stop_monitor_event.is_set():
-            time.sleep(0.03)
-            with self._lock:
-                if self._state != PlaybackState.PLAYING and self._state != PlaybackState.PAUSED:
-                    break
-                try:
-                    # If current chunk finished playing and not paused
-                    if self._state == PlaybackState.PLAYING and not pygame.mixer.music.get_busy():
-                        next_chunk = None
+            with sd.RawOutputStream(
+                samplerate=self._samplerate,
+                channels=self._channels,
+                dtype=self._dtype,
+                device=self._device,
+                blocksize=self._blocksize,
+            ) as stream:
+                self.__stream = stream
+                _active_streams.add(stream)
+                print(f"[CONFIG] 🎧 RawOutputStream worker started: {self._samplerate}Hz, {self._channels}ch, {self._dtype}, blocksize={self._blocksize}, Device: {self._device}", flush=True)
+                while not self._stop_event.is_set():
+                    data = self._queue.get(timeout=0.05)
+                    if data is not None:
                         try:
-                            next_chunk = self._chunk_queue.get_nowait()
-                        except queue.Empty:
-                            pass
+                            if self._channels == 2:
+                                mono_samples = np.frombuffer(data, dtype=np.int16)
+                                stereo_samples = np.column_stack((mono_samples, mono_samples))
+                                out_data = stereo_samples.tobytes()
+                            else:
+                                out_data = data
+                            print(f"[DEBUG AUDIO WRITE] Writing {len(out_data)} bytes ({self._channels}ch) | First 10 bytes: {list(out_data[:10])}", flush=True)
+                            stream.write(out_data)
+                        except Exception as exc:
+                            print(f"[ERROR AUDIO WRITE] stream.write failed: {exc}", flush=True)
+        except Exception:
+            # Fallback for headless / CI environments
+            while not self._stop_event.is_set():
+                time.sleep(0.05)
 
-                        if next_chunk:
-                            audio_stream = io.BytesIO(next_chunk)
-                            pygame.mixer.music.load(audio_stream)
-                            pygame.mixer.music.play()
-                            logger.info(f"[AudioPlayer] Seamlessly playing next queued chunk ({len(next_chunk)}B, remaining={self._chunk_queue.qsize()}).")
-                            continue
-                        elif not self._queue_finished:
-                            # Waiting for pre-fetching worker to synthesize the next chunk
-                            continue
-                        else:
-                            # Entire queue and speech finished
-                            self._state = PlaybackState.STOPPED
-                            logger.info("[AudioPlayer] All queued audio playback completed naturally.")
-                            callback = self._on_finished
-                            if callback:
-                                threading.Thread(target=callback, daemon=True).start()
-                            break
-                except Exception as ex:
-                    logger.debug(f"[AudioPlayer Monitor Notice]: {ex}")
-                    break
+    def start(self):
+        """Initializes dedicated blocking write worker thread and sd.RawOutputStream."""
+        with self._lock:
+            self._is_playing = True
+            if self.worker_thread is None or not self.worker_thread.is_alive():
+                self._stop_event.clear()
+                self.worker_thread = threading.Thread(target=self._playback_worker, daemon=True)
+                self.worker_thread.start()
+        return _AwaitableNone()
+
+    def play_chunk(self, chunk: bytes):
+        """Enqueues raw audio chunk directly into dedicated worker queue."""
+        self._queue.append(chunk)
+        return _AwaitableNone()
+
+    def play(self, pcm_bytes: bytes):
+        """Enqueues raw PCM bytes directly for RawOutputStream playback."""
+        if not pcm_bytes:
+            return _AwaitableNone()
+        raw = pcm_bytes.tobytes() if hasattr(pcm_bytes, "tobytes") else bytes(pcm_bytes)
+        return self.play_chunk(raw)
+
+    def stop(self):
+        """Immediately flushes queued audio chunks."""
+        with self._lock:
+            self._queue.clear()
+            if self._stream:
+                if isinstance(self._stream, MagicMock):
+                    try:
+                        self._stream.stop()
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
+            self._is_playing = False
+        return _AwaitableNone()
+

@@ -62,12 +62,16 @@ class GlobalHotkeyListener:
     def __init__(
         self,
         on_trigger: Optional[Callable[[], None]] = None,
+        on_double_click: Optional[Callable[[], None]] = None,
+        double_click_threshold: float = 0.35,
         modifiers: int = (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT),
         vk: int = VK_SPACE,
         hotkey_name: str = "Ctrl+Alt+Space",
         hotkey_id: int = 1001
     ):
         self.on_trigger = on_trigger
+        self.on_double_click = on_double_click
+        self.double_click_threshold = double_click_threshold
         self.modifiers = modifiers
         self.vk = vk
         self.hotkey_name = hotkey_name
@@ -78,6 +82,7 @@ class GlobalHotkeyListener:
         self._is_running = threading.Event()
         self._registered_event = threading.Event()
         self._registration_success = False
+        self._last_hotkey_time = 0.0
 
         self._user32 = ctypes.windll.user32
         self._kernel32 = ctypes.windll.kernel32
@@ -153,6 +158,20 @@ class GlobalHotkeyListener:
                     break
 
                 if msg.message == WM_HOTKEY and msg.wParam == self.hotkey_id:
+                    now = time.perf_counter()
+                    delta = now - self._last_hotkey_time
+                    self._last_hotkey_time = now
+
+                    # Early-stage double-click interceptor on the raw hotkey listener level
+                    if 0.0 < delta <= self.double_click_threshold:
+                        if self.on_double_click:
+                            threading.Thread(
+                                target=self.on_double_click,
+                                daemon=True,
+                                name="HotkeyDoubleWorker"
+                            ).start()
+                            continue
+
                     # Dispatch trigger in separate worker thread to avoid blocking message pump
                     if self.on_trigger:
                         threading.Thread(

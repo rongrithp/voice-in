@@ -29,6 +29,8 @@ MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 if MODULE_DIR not in sys.path:
     sys.path.insert(0, MODULE_DIR)
 
+from intent_memory import IntentMemory, get_memory
+
 
 class IntentResult:
     """Encapsulates the parsed intent, resolved CLI command, and execution safety status."""
@@ -41,7 +43,8 @@ class IntentResult:
         command: Optional[str],
         raw_text: str,
         confidence: float = 1.0,
-        warning: Optional[str] = None
+        warning: Optional[str] = None,
+        auto_submit: bool = False
     ):
         self.is_matched = is_matched
         self.intent_id = intent_id
@@ -50,6 +53,7 @@ class IntentResult:
         self.raw_text = raw_text
         self.confidence = confidence
         self.warning = warning
+        self.auto_submit = auto_submit
 
     @property
     def executable_command(self) -> str:
@@ -68,7 +72,8 @@ class IntentResult:
             "executable_command": self.executable_command,
             "raw_text": self.raw_text,
             "confidence": self.confidence,
-            "warning": self.warning
+            "warning": self.warning,
+            "auto_submit": self.auto_submit
         }
 
     def summary(self) -> str:
@@ -122,11 +127,30 @@ class IntentParser:
     Supports relaxed pattern matching, fuzzy/partial keywords, and safe fallbacks.
     """
 
-    def __init__(self):
+    def __init__(self, memory: Optional[IntentMemory] = None):
+        self.memory = memory or get_memory()
         self.rules: List[IntentRule] = self._build_rules()
 
     def _build_rules(self) -> List[IntentRule]:
         return [
+            # 0. Gemini Live Multimodal Co-pilot Wake ("เจมิไนมาช่วยหน่อย" / "gemini help")
+            IntentRule(
+                intent_id="GEMINI_LIVE_WAKE",
+                action_name="Gemini Live Co-pilot Wake",
+                command="python gemini_live_client.py",
+                patterns=[
+                    r"(เจมิไน.*ช่วย|เจมิไน.*มาช่วย|gemini.*help|gemini.*come|เจมิไน)",
+                ]
+            ),
+            # 0b. Session Termination & Standby Return (Strict exact matching: ["พอแล้ว", "ขอบคุณมาก", "พอแค่นี้", "stop"])
+            IntentRule(
+                intent_id="SESSION_STANDBY_DISMISS",
+                action_name="Session Standby Dismiss",
+                command="echo [SESSION DISMISSED -> STANDBY]",
+                patterns=[
+                    r"^(พอแล้ว|ขอบคุณมาก|พอแค่นี้|stop)$",
+                ]
+            ),
             # 1. Open Browser (Relaxed matching: catches "But browser", "Ất browser", "browser", "chrome")
             IntentRule(
                 intent_id="OPEN_BROWSER",
@@ -233,7 +257,7 @@ class IntentParser:
 
     def parse(self, text: str) -> IntentResult:
         """
-        Parses text and matches against intent rules.
+        Parses text and matches against user rules first, then static rules.
         Returns IntentResult with resolved command or safe fallback warning.
         """
         if not text or not text.strip():
@@ -244,12 +268,27 @@ class IntentParser:
                 command=None,
                 raw_text="",
                 confidence=0.0,
-                warning="Voice input was empty or silent"
+                warning="Voice input was empty or silent",
+                auto_submit=False
             )
 
         clean_text = clean_intent_text(text)
 
-        # Iterate rules
+        # 1. PRIORITY CHECK: Consult user_rules.json first
+        mem_rule = self.memory.get_mapped_command(clean_text)
+        if mem_rule:
+            return IntentResult(
+                is_matched=True,
+                intent_id="USER_LEARNED",
+                action_name=mem_rule.get("action_name", f"Run: {mem_rule['command']}"),
+                command=mem_rule["command"],
+                raw_text=text.strip(),
+                confidence=1.0,
+                warning=None,
+                auto_submit=mem_rule.get("auto_submit", True)
+            )
+
+        # 2. Static Intent Rules
         for rule in self.rules:
             conf = rule.match(clean_text)
             if conf is not None:
@@ -260,10 +299,11 @@ class IntentParser:
                     command=rule.command,
                     raw_text=text.strip(),
                     confidence=conf,
-                    warning=None
+                    warning=None,
+                    auto_submit=False  # Newly detected / unconfirmed: requires prompt!
                 )
 
-        # Safe fallback for unknown intents
+        # 3. Safe fallback for unknown intents
         return IntentResult(
             is_matched=False,
             intent_id="UNKNOWN_INTENT",
@@ -271,7 +311,8 @@ class IntentParser:
             command=None,
             raw_text=text.strip(),
             confidence=0.0,
-            warning=f"No matching command found for: '{text.strip()}'"
+            warning=f"No matching command found for: '{text.strip()}'",
+            auto_submit=False
         )
 
 
@@ -339,6 +380,57 @@ def run_intent_parser_tests() -> bool:
         assert res.warning is not None, "Warning must be present for unknown intent"
         assert res.executable_command.startswith("echo [SAFE FALLBACK]"), "Safe fallback command missing"
         passed_count += 1
+
+    # Standby Dismiss Strict Exact Matching & Non-matching verification
+    print("\n[Testing Strict Standby Dismiss Exact Matching vs Question Words]...")
+    dismiss_cases = [
+        ("พอแล้ว", True),
+        ("ขอบคุณมาก", True),
+        ("พอแค่นี้", True),
+        ("stop", True),
+        ("อธิบายหน่อย...", False),
+        ("เป็นยังไง", False),
+        ("ช่วยอธิบายหน่อย", False),
+        ("หยุดก่อน", False),
+    ]
+    for text_in, should_dismiss in dismiss_cases:
+        r = parser.parse(text_in)
+        is_dismiss = (r.intent_id == "SESSION_STANDBY_DISMISS")
+        status = "OK" if is_dismiss == should_dismiss else "FAIL"
+        print(f"[{status}] '{text_in}' -> is_dismiss={is_dismiss} (expected {should_dismiss})")
+        assert is_dismiss == should_dismiss, f"Standby dismiss mismatch for '{text_in}'"
+        passed_count += 1
+
+    # Adaptive Memory Priority & Auto-Submit Verification
+    print("\n[Testing Adaptive Memory Priority & Auto-Submit Flow]...")
+    import tempfile
+    test_rules_path = os.path.join(tempfile.gettempdir(), "test_user_rules_parser.json")
+    if os.path.exists(test_rules_path):
+        os.remove(test_rules_path)
+
+    mem = IntentMemory(filepath=test_rules_path)
+    parser_with_mem = IntentParser(memory=mem)
+
+    # 1. Unlearned phrase triggers confirmation (auto_submit=False)
+    test_phrase = "เปิดโปรแกรมสปอติฟาย"
+    res1 = parser_with_mem.parse(test_phrase)
+    print(f"      Step 1 (Unlearned):   '{test_phrase}' -> Matched={res1.is_matched} | auto_submit={res1.auto_submit}")
+    assert res1.auto_submit is False, "Unlearned phrase must require confirmation (auto_submit=False)"
+
+    # 2. Simulate User selecting [A] (Learn phrase to memory with auto_submit=True)
+    mem.save_rule(phrase=test_phrase, command="start spotify", auto_submit=True, action_name="Launch Spotify")
+
+    # 3. Subsequent call bypasses confirmation and executes directly
+    res2 = parser_with_mem.parse(test_phrase)
+    print(f"      Step 2 (Subsequent):  '{test_phrase}' -> Intent={res2.intent_id} | Cmd=`{res2.command}` | auto_submit={res2.auto_submit}")
+    assert res2.is_matched is True, "Subsequent call must match"
+    assert res2.intent_id == "USER_LEARNED", f"Expected USER_LEARNED, got {res2.intent_id}"
+    assert res2.command == "start spotify", f"Expected 'start spotify', got {res2.command}"
+    assert res2.auto_submit is True, "Subsequent call must bypass confirmation (auto_submit=True)"
+    passed_count += 2
+
+    if os.path.exists(test_rules_path):
+        os.remove(test_rules_path)
 
     print("\n" + "=" * 65)
     print(f" ALL {passed_count} INTENT PARSER TESTS PASSED (0 ERRORS)")
